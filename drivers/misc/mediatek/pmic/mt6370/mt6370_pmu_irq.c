@@ -220,7 +220,7 @@ static const struct irq_domain_ops mt6370_pmu_irq_domain_ops = {
 static irqreturn_t mt6370_pmu_irq_handler(int irq, void *priv)
 {
 	struct mt6370_pmu_chip *chip = (struct mt6370_pmu_chip *)priv;
-	u8 irq_ind = 0, data[16] = { 0 }, mask[16] = {
+	u8 data[16] = { 0 }, mask[16] = {
 	0};
 	u8 stat_chg[16] = { 0 }, stat_old[16] = {
 	0}, stat_new[16] = {
@@ -244,10 +244,9 @@ static irqreturn_t mt6370_pmu_irq_handler(int irq, void *priv)
 		dev_err(chip->dev, "read irq indicator fail\n");
 		goto out_irq_handler;
 	}
-	irq_ind = ret;
 
 	/* read stat before reading irq evt */
-	ret = mt6370_pmu_reg_block_read(chip, MT6370_PMU_REG_CHGSTAT1, 16,
+	mt6370_pmu_reg_block_read(chip, MT6370_PMU_REG_CHGSTAT1, 16,
 					stat_old);
 	if (ret < 0) {
 		dev_err(chip->dev, "read prev irq stat fail\n");
