@@ -874,10 +874,8 @@ static struct multi_transaction *multi_transaction_new(struct file *file,
 	if (!t)
 		return ERR_PTR(-ENOMEM);
 	kref_init(&t->count);
-	if (copy_from_user(t->data, buf, size)) {
-		put_multi_transaction(t);
+	if (copy_from_user(t->data, buf, size))
 		return ERR_PTR(-EFAULT);
-	}
 
 	return t;
 }
@@ -1901,6 +1899,9 @@ fail2:
 
 	return error;
 }
+
+
+#define list_entry_is_head(pos, head, member) (&pos->member == (head))
 
 /**
  * __next_ns - find the next namespace to list
