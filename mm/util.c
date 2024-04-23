@@ -14,10 +14,15 @@
 #include <linux/hugetlb.h>
 #include <linux/vmalloc.h>
 #include <linux/userfaultfd_k.h>
-#include <linux/random.h>
 
 #include <asm/sections.h>
 #include <linux/uaccess.h>
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/01/22,
+ * reserved area operations
+ */
+#include <linux/resmap_account.h>
+#endif
 
 #include "internal.h"
 
@@ -239,13 +244,26 @@ void __vma_link_list(struct mm_struct *mm, struct vm_area_struct *vma,
 		struct vm_area_struct *prev, struct rb_node *rb_parent)
 {
 	struct vm_area_struct *next;
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
+	 * use reserved area
+	 */
+	struct vm_area_struct *curr_vma = NULL;
+#endif
 
 	vma->vm_prev = prev;
 	if (prev) {
 		next = prev->vm_next;
 		prev->vm_next = vma;
 	} else {
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+		/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
+		 * use reserved area
+		 */
+		curr_vma = vma;
+#else
 		mm->mmap = vma;
+#endif
 		if (rb_parent)
 			next = rb_entry(rb_parent,
 					struct vm_area_struct, vm_rb);
@@ -255,6 +273,18 @@ void __vma_link_list(struct mm_struct *mm, struct vm_area_struct *vma,
 	vma->vm_next = next;
 	if (next)
 		next->vm_prev = vma;
+
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
+	 * use reserved area
+	 */
+	if (curr_vma) {
+		if (BACKUP_ALLOC_FLAG(vma->vm_flags))
+			mm->reserve_mmap = curr_vma;
+		else
+			mm->mmap = curr_vma;
+	}
+#endif
 }
 
 /* Check if the vma is being used as a stack by this task */
@@ -263,38 +293,6 @@ int vma_is_stack_for_current(struct vm_area_struct *vma)
 	struct task_struct * __maybe_unused t = current;
 
 	return (vma->vm_start <= KSTK_ESP(t) && vma->vm_end >= KSTK_ESP(t));
-}
-
-/**
- * randomize_page - Generate a random, page aligned address
- * @start:	The smallest acceptable address the caller will take.
- * @range:	The size of the area, starting at @start, within which the
- *		random address must fall.
- *
- * If @start + @range would overflow, @range is capped.
- *
- * NOTE: Historical use of randomize_range, which this replaces, presumed that
- * @start was already page aligned.  We now align it regardless.
- *
- * Return: A page aligned address within [start, start + range).  On error,
- * @start is returned.
- */
-unsigned long randomize_page(unsigned long start, unsigned long range)
-{
-	if (!PAGE_ALIGNED(start)) {
-		range -= PAGE_ALIGN(start) - start;
-		start = PAGE_ALIGN(start);
-	}
-
-	if (start > ULONG_MAX - range)
-		range = ULONG_MAX - start;
-
-	range >>= PAGE_SHIFT;
-
-	if (range == 0)
-		return start;
-
-	return start + (get_random_long() % range << PAGE_SHIFT);
 }
 
 #if defined(CONFIG_MMU) && !defined(HAVE_ARCH_PICK_MMAP_LAYOUT)
@@ -365,6 +363,14 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 			return -EINTR;
 		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
 				    &populate, &uf);
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+		/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/27,
+		 * update the mm->mmap_base while create reserved area pass,
+		 * the gap between stack and mmap_base is decreased.
+		 */
+		if (!IS_ERR_VALUE(ret) && check_reserve_mmap_doing(mm))
+			mm->mmap_base += RESERVE_VMAP_AREA_SIZE;
+#endif
 		up_write(&mm->mmap_sem);
 		userfaultfd_unmap_complete(mm, &uf);
 		if (populate)
@@ -386,6 +392,7 @@ unsigned long vm_mmap(struct file *file, unsigned long addr,
 }
 EXPORT_SYMBOL(vm_mmap);
 
+#define KMALLOC_MAX_PAGES 8
 /**
  * kvmalloc_node - attempt to allocate physically contiguous memory, but upon
  * failure, fall back to non-contiguous (vmalloc) allocation.
@@ -407,6 +414,10 @@ void *kvmalloc_node(size_t size, gfp_t flags, int node)
 {
 	gfp_t kmalloc_flags = flags;
 	void *ret;
+
+	/*do not attempt kmalloc if we need more than KMALLOC_MAX_PAGES pages at once*/
+	if (size >= KMALLOC_MAX_PAGES * PAGE_SIZE)
+		goto use_vmalloc;
 
 	/*
 	 * vmalloc uses GFP_KERNEL for some internal allocations (e.g page tables)
@@ -437,7 +448,7 @@ void *kvmalloc_node(size_t size, gfp_t flags, int node)
 	 */
 	if (ret || size <= PAGE_SIZE)
 		return ret;
-
+use_vmalloc:
 	return __vmalloc_node_flags_caller(size, node, flags,
 			__builtin_return_address(0));
 }

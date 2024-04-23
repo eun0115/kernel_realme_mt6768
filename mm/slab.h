@@ -134,6 +134,10 @@ static inline unsigned long kmem_cache_flags(unsigned long object_size,
 #elif defined(CONFIG_SLUB_DEBUG)
 #define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER | \
 			  SLAB_TRACE | SLAB_CONSISTENCY_CHECKS)
+#elif defined(OPLUS_FEATURE_MEMLEAK_DETECT) && defined(CONFIG_KMALLOC_DEBUG)
+/* Kui.Zhang@tech.kernel.mm, 2020-02-12, create kmalloc cache with sotre user.
+*/
+#define SLAB_DEBUG_FLAGS (SLAB_STORE_USER)
 #else
 #define SLAB_DEBUG_FLAGS (0)
 #endif
@@ -146,7 +150,7 @@ static inline unsigned long kmem_cache_flags(unsigned long object_size,
 #define SLAB_CACHE_FLAGS (SLAB_NOLEAKTRACE | SLAB_RECLAIM_ACCOUNT | \
 			  SLAB_TEMPORARY | SLAB_ACCOUNT)
 #else
-#define SLAB_CACHE_FLAGS (SLAB_NOLEAKTRACE)
+#define SLAB_CACHE_FLAGS (0)
 #endif
 
 /* Common flags available with current configuration */
@@ -470,7 +474,7 @@ struct kmem_cache_node {
 #ifdef CONFIG_SLUB
 	unsigned long nr_partial;
 	struct list_head partial;
-#ifdef CONFIG_SLUB_DEBUG
+#if defined(CONFIG_SLUB_DEBUG) || (defined(OPLUS_FEATURE_MEMLEAK_DETECT) && defined(CONFIG_KMALLOC_DEBUG))
 	atomic_long_t nr_slabs;
 	atomic_long_t total_objects;
 	struct list_head full;
