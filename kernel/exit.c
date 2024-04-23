@@ -62,57 +62,17 @@
 #include <linux/random.h>
 #include <linux/rcuwait.h>
 #include <linux/compat.h>
-#include <linux/sysfs.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/pgtable.h>
 #include <asm/mmu_context.h>
 
-/*
- * The default value should be high enough to not crash a system that randomly
- * crashes its kernel from time to time, but low enough to at least not permit
- * overflowing 32-bit refcounts or the ldsem writer count.
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/01/22,
+ * reserved area operations
  */
-static unsigned int oops_limit = 10000;
-
-#ifdef CONFIG_SYSCTL
-static struct ctl_table kern_exit_table[] = {
-	{
-		.procname       = "oops_limit",
-		.data           = &oops_limit,
-		.maxlen         = sizeof(oops_limit),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{ }
-};
-
-static __init int kernel_exit_sysctls_init(void)
-{
-	register_sysctl_init("kernel", kern_exit_table);
-	return 0;
-}
-late_initcall(kernel_exit_sysctls_init);
-#endif
-
-static atomic_t oops_count = ATOMIC_INIT(0);
-
-#ifdef CONFIG_SYSFS
-static ssize_t oops_count_show(struct kobject *kobj, struct kobj_attribute *attr,
-			       char *page)
-{
-	return sysfs_emit(page, "%d\n", atomic_read(&oops_count));
-}
-
-static struct kobj_attribute oops_count_attr = __ATTR_RO(oops_count);
-
-static __init int kernel_exit_sysfs_init(void)
-{
-	sysfs_add_file_to_group(kernel_kobj, &oops_count_attr.attr, NULL);
-	return 0;
-}
-late_initcall(kernel_exit_sysfs_init);
+#include <linux/resmap_account.h>
 #endif
 
 static void __unhash_process(struct task_struct *p, bool group_dead)
@@ -124,6 +84,10 @@ static void __unhash_process(struct task_struct *p, bool group_dead)
 		detach_pid(p, PIDTYPE_SID);
 
 		list_del_rcu(&p->tasks);
+#if defined(OPLUS_FEATURE_MEMLEAK_DETECT) && defined(CONFIG_ION) && defined(CONFIG_DUMP_TASKS_MEM)
+		/* Peifeng.Li@BSP.Kernel.MM, 2020-05-20 delete the task */
+		list_del_rcu(&p->user_tasks);
+#endif
 		list_del_init(&p->sibling);
 		__this_cpu_dec(process_counts);
 	}
@@ -139,7 +103,7 @@ static void __exit_signal(struct task_struct *tsk)
 	struct signal_struct *sig = tsk->signal;
 	bool group_dead = thread_group_leader(tsk);
 	struct sighand_struct *sighand;
-	struct tty_struct *tty;
+	struct tty_struct *uninitialized_var(tty);
 	u64 utime, stime;
 
 	sighand = rcu_dereference_check(tsk->sighand,
@@ -232,6 +196,14 @@ void release_task(struct task_struct *p)
 {
 	struct task_struct *leader;
 	int zap_leader;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	if (p->fpack) {
+		if (p->fpack->iname)
+			__putname(p->fpack->iname);
+		kfree(p->fpack);
+		p->fpack = NULL;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 repeat:
 	/* don't need to get the RCU readlock here - the process is dead and
 	 * can't be modifying its own credentials. But shut RCU-lockdep up */
@@ -416,6 +388,23 @@ static bool has_stopped_jobs(struct pid *pgrp)
 	return false;
 }
 
+#ifdef OPLUS_BUG_STABILITY
+//Shu.Liu@ANDROID.STABILITY.1052210, 2014/01/20, Add for not kill zygote
+static bool oppo_is_android_core_group(struct pid *pgrp)
+{
+    struct task_struct *p;
+
+    do_each_pid_task(pgrp, PIDTYPE_PGID, p) {
+        if (( !strcmp(p->comm, "zygote") ) || ( !strcmp(p->comm, "main")) ) {
+            printk("oppo_is_android_core_group: find zygote will be hungup, ignore it \n");
+            return true;
+        }
+    } while_each_pid_task(pgrp, PIDTYPE_PGID, p);
+
+    return false;
+}
+#endif /*OPLUS_BUG_STABILITY*/
+
 /*
  * Check to see if any process groups have become orphaned as
  * a result of our exiting, and if they have any stopped jobs,
@@ -442,6 +431,13 @@ kill_orphaned_pgrp(struct task_struct *tsk, struct task_struct *parent)
 	    task_session(parent) == task_session(tsk) &&
 	    will_become_orphaned_pgrp(pgrp, ignored_task) &&
 	    has_stopped_jobs(pgrp)) {
+#ifdef OPLUS_BUG_STABILITY
+//Shu.Liu@ANDROID.STABILITY.1052210, 2014/01/10, Add for clean backstage
+            if (oppo_is_android_core_group(pgrp)) {
+                printk("kill_orphaned_pgrp: find android core process will be hungup, ignored it, only hungup itself:%s:%d , current=%d \n",tsk->comm,tsk->pid,current->pid);
+                return;
+            }
+#endif /*OPLUS_BUG_STABILITY*/
 		__kill_pgrp_info(SIGHUP, SEND_SIG_PRIV, pgrp);
 		__kill_pgrp_info(SIGCONT, SEND_SIG_PRIV, pgrp);
 	}
@@ -563,10 +559,7 @@ static void exit_mm(void)
 		up_read(&mm->mmap_sem);
 
 		self.task = current;
-		if (self.task->flags & PF_SIGNALED)
-			self.next = xchg(&core_state->dumper.next, &self);
-		else
-			self.task = NULL;
+		self.next = xchg(&core_state->dumper.next, &self);
 		/*
 		 * Implies mb(), the result of xchg() must be visible
 		 * to core_state->dumper.
@@ -592,6 +585,12 @@ static void exit_mm(void)
 	enter_lazy_tlb(mm, current);
 	task_unlock(current);
 	mm_update_next_owner(mm);
+#if defined(OPLUS_FEATURE_VIRTUAL_RESERVE_MEMORY) && defined(CONFIG_OPPO_HEALTHINFO) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
+	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
+	 * Trigger and upload the event.
+	 */
+	trigger_svm_oom_event(mm, false, false);
+#endif
 	mmput(mm);
 	if (test_thread_flag(TIF_MEMDIE))
 		exit_oom_victim();
@@ -816,10 +815,51 @@ static void check_stack_usage(void)
 static inline void check_stack_usage(void) {}
 #endif
 
+#ifdef OPLUS_BUG_STABILITY
+//Haoran.Zhang@ANDROID.STABILITY.1052210, 2016/05/24, Add for debug critical svc crash
+static bool is_zygote_process(struct task_struct *t)
+{
+	const struct cred *tcred = __task_cred(t);
+
+	struct task_struct * first_child = NULL;
+	if(t->children.next && t->children.next != (struct list_head*)&t->children.next)
+		first_child = container_of(t->children.next, struct task_struct, sibling);
+	if(!strcmp(t->comm, "main") && (tcred->uid.val == 0) && (t->parent != 0 && !strcmp(t->parent->comm,"init"))  )
+		return true;
+	else
+		return false;
+	return false;
+}
+
+static bool is_critial_process(struct task_struct *t) {
+    if(t->group_leader && (!strcmp(t->group_leader->comm, "system_server") || is_zygote_process(t) || !strcmp(t->group_leader->comm, "surfaceflinger") || !strcmp(t->group_leader->comm, "servicemanager")))
+    {
+       if (t->pid == t->tgid)
+       {
+          return true;
+       }
+       else
+       {
+          return false;
+       }
+    } else {
+        return false;
+    }
+
+}
+#endif /*OPLUS_BUG_STABILITY*/
+
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+
+#ifdef OPLUS_BUG_STABILITY
+//Haoran.Zhang@ANDROID.STABILITY.1052210, 2016/05/24, Add for debug critical svc crash
+    if (is_critial_process(tsk)) {
+        printk("critical svc %d:%s exit with %ld !\n", tsk->pid, tsk->comm,code);
+    }
+#endif /*OPLUS_BUG_STABILITY*/
 
 	/*
 	 * We can get here from a kernel oops, sometimes with preemption off.
@@ -850,7 +890,6 @@ void __noreturn do_exit(long code)
 			preempt_count());
 		preempt_count_set(PREEMPT_ENABLED);
 	}
-
 	profile_task_exit(tsk);
 	kcov_task_exit(tsk);
 
@@ -926,6 +965,7 @@ void __noreturn do_exit(long code)
 
 	sched_autogroup_exit_task(tsk);
 	cgroup_exit(tsk);
+	uclamp_exit_task(tsk);
 
 	/*
 	 * FIXME: do that only when needed, using sched_exit tracepoint
@@ -967,31 +1007,6 @@ void __noreturn do_exit(long code)
 	do_task_dead();
 }
 EXPORT_SYMBOL_GPL(do_exit);
-
-void __noreturn make_task_dead(int signr)
-{
-	/*
-	 * Take the task off the cpu after something catastrophic has
-	 * happened.
-	 */
-	unsigned int limit;
-
-	/*
-	 * Every time the system oopses, if the oops happens while a reference
-	 * to an object was held, the reference leaks.
-	 * If the oops doesn't also leak memory, repeated oopsing can cause
-	 * reference counters to wrap around (if they're not using refcount_t).
-	 * This means that repeated oopsing can make unexploitable-looking bugs
-	 * exploitable through repeated oopsing.
-	 * To make sure this can't happen, place an upper bound on how often the
-	 * kernel may oops without panic().
-	 */
-	limit = READ_ONCE(oops_limit);
-	if (atomic_inc_return(&oops_count) >= limit && limit)
-		panic("Oopsed too often (kernel.oops_limit is %d)", limit);
-
-	do_exit(signr);
-}
 
 void complete_and_exit(struct completion *comp, long code)
 {

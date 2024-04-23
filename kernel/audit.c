@@ -509,22 +509,20 @@ static void kauditd_printk_skb(struct sk_buff *skb)
 /**
  * kauditd_rehold_skb - Handle a audit record send failure in the hold queue
  * @skb: audit record
- * @error: error code (unused)
  *
  * Description:
  * This should only be used by the kauditd_thread when it fails to flush the
  * hold queue.
  */
-static void kauditd_rehold_skb(struct sk_buff *skb, __always_unused int error)
+static void kauditd_rehold_skb(struct sk_buff *skb)
 {
-	/* put the record back in the queue */
-	skb_queue_tail(&audit_hold_queue, skb);
+	/* put the record back in the queue at the same place */
+	skb_queue_head(&audit_hold_queue, skb);
 }
 
 /**
  * kauditd_hold_skb - Queue an audit record, waiting for auditd
  * @skb: audit record
- * @error: error code
  *
  * Description:
  * Queue the audit record, waiting for an instance of auditd.  When this
@@ -534,31 +532,19 @@ static void kauditd_rehold_skb(struct sk_buff *skb, __always_unused int error)
  * and queue it, if we have room.  If we want to hold on to the record, but we
  * don't have room, record a record lost message.
  */
-static void kauditd_hold_skb(struct sk_buff *skb, int error)
+static void kauditd_hold_skb(struct sk_buff *skb)
 {
 	/* at this point it is uncertain if we will ever send this to auditd so
 	 * try to send the message via printk before we go any further */
 	kauditd_printk_skb(skb);
 
 	/* can we just silently drop the message? */
-	if (!audit_default)
-		goto drop;
-
-	/* the hold queue is only for when the daemon goes away completely,
-	 * not -EAGAIN failures; if we are in a -EAGAIN state requeue the
-	 * record on the retry queue unless it's full, in which case drop it
-	 */
-	if (error == -EAGAIN) {
-		if (!audit_backlog_limit ||
-		    skb_queue_len(&audit_retry_queue) < audit_backlog_limit) {
-			skb_queue_tail(&audit_retry_queue, skb);
-			return;
-		}
-		audit_log_lost("kauditd retry queue overflow");
-		goto drop;
+	if (!audit_default) {
+		kfree_skb(skb);
+		return;
 	}
 
-	/* if we have room in the hold queue, queue the message */
+	/* if we have room, queue the message */
 	if (!audit_backlog_limit ||
 	    skb_queue_len(&audit_hold_queue) < audit_backlog_limit) {
 		skb_queue_tail(&audit_hold_queue, skb);
@@ -567,32 +553,24 @@ static void kauditd_hold_skb(struct sk_buff *skb, int error)
 
 	/* we have no other options - drop the message */
 	audit_log_lost("kauditd hold queue overflow");
-drop:
 	kfree_skb(skb);
 }
 
 /**
  * kauditd_retry_skb - Queue an audit record, attempt to send again to auditd
  * @skb: audit record
- * @error: error code (unused)
  *
  * Description:
  * Not as serious as kauditd_hold_skb() as we still have a connected auditd,
  * but for some reason we are having problems sending it audit records so
  * queue the given record and attempt to resend.
  */
-static void kauditd_retry_skb(struct sk_buff *skb, __always_unused int error)
+static void kauditd_retry_skb(struct sk_buff *skb)
 {
-	if (!audit_backlog_limit ||
-	    skb_queue_len(&audit_retry_queue) < audit_backlog_limit) {
-		skb_queue_tail(&audit_retry_queue, skb);
-		return;
-	}
-
-	/* we have to drop the record, send it via printk as a last effort */
-	kauditd_printk_skb(skb);
-	audit_log_lost("kauditd retry queue overflow");
-	kfree_skb(skb);
+	/* NOTE: because records should only live in the retry queue for a
+	 * short period of time, before either being sent or moved to the hold
+	 * queue, we don't currently enforce a limit on this queue */
+	skb_queue_tail(&audit_retry_queue, skb);
 }
 
 /**
@@ -630,7 +608,7 @@ static void auditd_reset(const struct auditd_connection *ac)
 	/* flush the retry queue to the hold queue, but don't touch the main
 	 * queue since we need to process that normally for multicast */
 	while ((skb = skb_dequeue(&audit_retry_queue)))
-		kauditd_hold_skb(skb, -ECONNREFUSED);
+		kauditd_hold_skb(skb);
 }
 
 /**
@@ -704,18 +682,16 @@ static int kauditd_send_queue(struct sock *sk, u32 portid,
 			      struct sk_buff_head *queue,
 			      unsigned int retry_limit,
 			      void (*skb_hook)(struct sk_buff *skb),
-			      void (*err_hook)(struct sk_buff *skb, int error))
+			      void (*err_hook)(struct sk_buff *skb))
 {
 	int rc = 0;
-	struct sk_buff *skb = NULL;
-	struct sk_buff *skb_tail;
-	unsigned int failed = 0;
+	struct sk_buff *skb;
+	static unsigned int failed = 0;
 
 	/* NOTE: kauditd_thread takes care of all our locking, we just use
 	 *       the netlink info passed to us (e.g. sk and portid) */
 
-	skb_tail = skb_peek_tail(queue);
-	while ((skb != skb_tail) && (skb = skb_dequeue(queue))) {
+	while ((skb = skb_dequeue(queue))) {
 		/* call the skb_hook for each skb we touch */
 		if (skb_hook)
 			(*skb_hook)(skb);
@@ -723,34 +699,36 @@ static int kauditd_send_queue(struct sock *sk, u32 portid,
 		/* can we send to anyone via unicast? */
 		if (!sk) {
 			if (err_hook)
-				(*err_hook)(skb, -ECONNREFUSED);
+				(*err_hook)(skb);
 			continue;
 		}
 
-retry:
 		/* grab an extra skb reference in case of error */
 		skb_get(skb);
 		rc = netlink_unicast(sk, skb, portid, 0);
 		if (rc < 0) {
-			/* send failed - try a few times unless fatal error */
+			/* fatal failure for our queue flush attempt? */
 			if (++failed >= retry_limit ||
 			    rc == -ECONNREFUSED || rc == -EPERM) {
+				/* yes - error processing for the queue */
 				sk = NULL;
 				if (err_hook)
-					(*err_hook)(skb, rc);
-				if (rc == -EAGAIN)
-					rc = 0;
-				/* continue to drain the queue */
+					(*err_hook)(skb);
+				if (!skb_hook)
+					goto out;
+				/* keep processing with the skb_hook */
 				continue;
 			} else
-				goto retry;
+				/* no - requeue to preserve ordering */
+				skb_queue_head(queue, skb);
 		} else {
-			/* skb sent - drop the extra reference and continue */
+			/* it worked - drop the extra reference and continue */
 			consume_skb(skb);
 			failed = 0;
 		}
 	}
 
+out:
 	return (rc >= 0 ? 0 : rc);
 }
 
@@ -874,6 +852,19 @@ main_queue:
 
 	return 0;
 }
+
+#ifdef CONFIG_MTK_SELINUX_AEE_WARNING
+/*
+ * return skb field of audit buffer
+ */
+struct sk_buff *audit_get_skb(struct audit_buffer *ab)
+{
+	if (ab)
+		return (struct sk_buff *)(ab->skb);
+	else
+		return NULL;
+}
+#endif
 
 int audit_send_list_thread(void *_dest)
 {
@@ -1540,8 +1531,7 @@ static int __net_init audit_net_init(struct net *net)
 		audit_panic("cannot initialize netlink socket in namespace");
 		return -ENOMEM;
 	}
-	/* limit the timeout in case auditd is blocked/stopped */
-	aunet->sk->sk_sndtimeo = HZ / 10;
+	aunet->sk->sk_sndtimeo = MAX_SCHEDULE_TIMEOUT;
 
 	return 0;
 }
@@ -1728,7 +1718,7 @@ struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask,
 {
 	struct audit_buffer *ab;
 	struct timespec64 t;
-	unsigned int serial;
+	unsigned int uninitialized_var(serial);
 
 	if (audit_initialized != AUDIT_INITIALIZED)
 		return NULL;

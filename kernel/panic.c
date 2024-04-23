@@ -28,10 +28,27 @@
 #include <linux/console.h>
 #include <linux/bug.h>
 #include <linux/ratelimit.h>
-#include <linux/sysfs.h>
+#include <soc/oppo/oppo_project.h>
 
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
+
+#ifdef OPLUS_FEATURE_PHOENIX
+// Kun.Hu@TECH.BSP.Stability.PHOENIX_PROJECT 2019/06/11, Add for phoenix project
+#include "../drivers/soc/oplus/system/oppo_phoenix/oppo_phoenix.h"
+#include <linux/timer.h>
+#include <linux/timex.h>
+#include <linux/rtc.h>
+//Liang.Zhang@PSW.TECH.BOOTUP, 2019/01/22, Add for monitor kernel error
+int kernel_panic_happened = 0;
+int hwt_happened = 0;
+#endif
+
+#ifdef OPLUS_FEATURE_PERFORMANCE
+//ZuoTong@ANDROID.PERFORMANCE, 2020/06/28,Add for flushing device cache before goto dump mode!
+bool is_triggering_panic = false;
+bool is_triggering_hwt = false;
+#endif  /*OPLUS_FEATURE_PERFORMANCE*/
 
 int panic_on_oops = CONFIG_PANIC_ON_OOPS_VALUE;
 static unsigned long tainted_mask;
@@ -40,7 +57,6 @@ static int pause_on_oops_flag;
 static DEFINE_SPINLOCK(pause_on_oops_lock);
 bool crash_kexec_post_notifiers;
 int panic_on_warn __read_mostly;
-static unsigned int warn_limit __read_mostly;
 
 int panic_timeout = CONFIG_PANIC_TIMEOUT;
 EXPORT_SYMBOL_GPL(panic_timeout);
@@ -48,45 +64,6 @@ EXPORT_SYMBOL_GPL(panic_timeout);
 ATOMIC_NOTIFIER_HEAD(panic_notifier_list);
 
 EXPORT_SYMBOL(panic_notifier_list);
-
-#ifdef CONFIG_SYSCTL
-static struct ctl_table kern_panic_table[] = {
-	{
-		.procname       = "warn_limit",
-		.data           = &warn_limit,
-		.maxlen         = sizeof(warn_limit),
-		.mode           = 0644,
-		.proc_handler   = proc_douintvec,
-	},
-	{ }
-};
-
-static __init int kernel_panic_sysctls_init(void)
-{
-	register_sysctl_init("kernel", kern_panic_table);
-	return 0;
-}
-late_initcall(kernel_panic_sysctls_init);
-#endif
-
-static atomic_t warn_count = ATOMIC_INIT(0);
-
-#ifdef CONFIG_SYSFS
-static ssize_t warn_count_show(struct kobject *kobj, struct kobj_attribute *attr,
-			       char *page)
-{
-	return sysfs_emit(page, "%d\n", atomic_read(&warn_count));
-}
-
-static struct kobj_attribute warn_count_attr = __ATTR_RO(warn_count);
-
-static __init int kernel_panic_sysfs_init(void)
-{
-	sysfs_add_file_to_group(kernel_kobj, &warn_count_attr.attr, NULL);
-	return 0;
-}
-late_initcall(kernel_panic_sysfs_init);
-#endif
 
 static long no_blink(int state)
 {
@@ -114,6 +91,34 @@ void __weak nmi_panic_self_stop(struct pt_regs *regs)
 {
 	panic_smp_self_stop();
 }
+
+#ifdef OPLUS_FEATURE_PHOENIX
+//Liang.Zhang@PSW.TECH.BOOTUP, 2018/11/12, Add for monitor kernel panic
+void deal_fatal_err(void)
+{
+    if(!phx_is_phoenix_boot_completed()) {
+
+        if(kernel_panic_happened) {
+            phx_set_boot_error(ERROR_KERNEL_PANIC);
+        } else if(hwt_happened) {
+            phx_set_boot_error(ERROR_HWT);
+        }
+
+    } else {
+        struct timespec ts;
+        struct rtc_time tm;
+        char err_info[60] = {0};
+
+        getnstimeofday(&ts);
+        rtc_time_to_tm(ts.tv_sec, &tm);
+
+        sprintf(err_info, "panic after bootup @%d-%d-%d %d:%d:%d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        pr_err("panic after bootup @%d-%d-%d %d:%d:%d\n",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+}
+#endif /*OPLUS_FEATURE_PHOENIX*/
 
 /*
  * Stop other CPUs in panic.  Architecture dependent code may override this
@@ -163,18 +168,18 @@ void nmi_panic(struct pt_regs *regs, const char *msg)
 }
 EXPORT_SYMBOL(nmi_panic);
 
-void check_panic_on_warn(const char *origin)
-{
-	unsigned int limit;
-
-	if (panic_on_warn)
-		panic("%s: panic_on_warn set ...\n", origin);
-
-	limit = READ_ONCE(warn_limit);
-	if (atomic_inc_return(&warn_count) >= limit && limit)
-		panic("%s: system warned too often (kernel.warn_limit is %d)",
-		      origin, limit);
+#ifdef OPLUS_FEATURE_PERFORMANCE
+//ZuoTong@ANDROID.PERFORMANCE, 2020/06/28,Add for flushing device cache before goto dump mode!
+extern int panic_flush_device_cache(int timeout);
+void flush_cache_on_panic(void){
+    if (get_eng_version() == 1){
+        pr_err("In full dump mode!\n");
+    }else{
+        pr_err("In mini dump mode and start flushing the devices cache!");
+        panic_flush_device_cache(2000);
+    }
 }
+#endif  /*OPLUS_FEATURE_PERFORMANCE*/
 
 /**
  *	panic - halt the system
@@ -192,16 +197,6 @@ void panic(const char *fmt, ...)
 	int state = 0;
 	int old_cpu, this_cpu;
 	bool _crash_kexec_post_notifiers = crash_kexec_post_notifiers;
-
-	if (panic_on_warn) {
-		/*
-		 * This thread may hit another WARN() in the panic path.
-		 * Resetting this prevents additional WARN() from panicking the
-		 * system on this thread.  Other threads are blocked by the
-		 * panic_mutex in panic().
-		 */
-		panic_on_warn = 0;
-	}
 
 	/*
 	 * Disable local interrupts. This will prevent panic_smp_self_stop
@@ -600,7 +595,16 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 	if (args)
 		vprintk(args->fmt, args->args);
 
-	check_panic_on_warn("kernel");
+	if (panic_on_warn) {
+		/*
+		 * This thread may hit another WARN() in the panic path.
+		 * Resetting this prevents additional WARN() from panicking the
+		 * system on this thread.  Other threads are blocked by the
+		 * panic_mutex in panic().
+		 */
+		panic_on_warn = 0;
+		panic("panic_on_warn set ...\n");
+	}
 
 	print_modules();
 
@@ -655,7 +659,7 @@ EXPORT_SYMBOL(warn_slowpath_null);
  */
 __visible void __stack_chk_fail(void)
 {
-	panic("stack-protector: Kernel stack is corrupted in: %pB\n",
+	panic("stack-protector: Kernel stack is corrupted in: %p\n",
 		__builtin_return_address(0));
 }
 EXPORT_SYMBOL(__stack_chk_fail);

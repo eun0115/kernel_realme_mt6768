@@ -1883,7 +1883,7 @@ static void handle_swbp(struct pt_regs *regs)
 {
 	struct uprobe *uprobe;
 	unsigned long bp_vaddr;
-	int is_swbp;
+	int uninitialized_var(is_swbp);
 
 	bp_vaddr = uprobe_get_swbp_addr(regs);
 	if (bp_vaddr == get_trampoline_vaddr())
@@ -1893,7 +1893,7 @@ static void handle_swbp(struct pt_regs *regs)
 	if (!uprobe) {
 		if (is_swbp > 0) {
 			/* No matching uprobe; signal SIGTRAP. */
-			force_sig(SIGTRAP, current);
+			send_sig(SIGTRAP, current, 0);
 		} else {
 			/*
 			 * Either we raced with uprobe_unregister() or we can't

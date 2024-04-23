@@ -35,6 +35,12 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/alarmtimer.h>
 
+#ifdef VENDOR_EDIT
+//SunFaliang@BSP.Power.Basic, 2020/05/01, add for wakelock profiler
+#include <soc/oppo/oppo_wakelock_profiler.h>
+#endif /* VENDOR_EDIT */
+
+
 /**
  * struct alarm_base - Alarm timer bases
  * @lock:		Lock for syncrhonized access to the base
@@ -164,8 +170,15 @@ static inline void alarmtimer_rtc_timer_init(void) { }
  */
 static void alarmtimer_enqueue(struct alarm_base *base, struct alarm *alarm)
 {
+	static DEFINE_RATELIMIT_STATE(ratelimit, HZ - 1, 5);
+
 	if (alarm->state & ALARMTIMER_STATE_ENQUEUED)
 		timerqueue_del(&base->timerqueue, &alarm->node);
+
+	if (__ratelimit(&ratelimit)) {
+		ratelimit.begin = jiffies;
+		pr_notice("%s, %lld\n", __func__, alarm->node.expires);
+	}
 
 	timerqueue_add(&base->timerqueue, &alarm->node);
 	alarm->state |= ALARMTIMER_STATE_ENQUEUED;
@@ -214,6 +227,12 @@ static enum hrtimer_restart alarmtimer_fired(struct hrtimer *timer)
 	if (alarm->function)
 		restart = alarm->function(alarm, base->gettime());
 
+
+    #ifdef VENDOR_EDIT
+	//Nanwei.Deng@BSP.Power.Basic 2018/04/28 add for count alarm times
+	alarmtimer_wakeup_count(alarm);
+    #endif /*VENDOR_EDIT*/
+
 	spin_lock_irqsave(&base->lock, flags);
 	if (restart != ALARMTIMER_NORESTART) {
 		hrtimer_set_expires(&alarm->timer, alarm->node.expires);
@@ -251,7 +270,7 @@ static int alarmtimer_suspend(struct device *dev)
 	int i, ret, type;
 	struct rtc_device *rtc;
 	unsigned long flags;
-	struct rtc_time tm;
+	struct rtc_time tm, time;
 
 	spin_lock_irqsave(&freezer_delta_lock, flags);
 	min = freezer_delta;
@@ -259,6 +278,10 @@ static int alarmtimer_suspend(struct device *dev)
 	type = freezer_alarmtype;
 	freezer_delta = 0;
 	spin_unlock_irqrestore(&freezer_delta_lock, flags);
+    #ifdef VENDOR_EDIT
+	//Nanwei.Deng@Kernel.Driver, 2018/11/19, add for analysis power coumption. count alarm times.
+	alarmtimer_suspend_flag_set();
+    #endif /*VENDOR_EDIT*/
 
 	rtc = alarmtimer_get_rtcdev();
 	/* If we have no rtcdev, just return */
@@ -288,6 +311,12 @@ static int alarmtimer_suspend(struct device *dev)
 
 	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
 		__pm_wakeup_event(ws, 2 * MSEC_PER_SEC);
+        #ifdef VENDOR_EDIT
+		//Nanwei.Deng@BSP.Power.Basic 2018/11/19, add for analysis power coumption. count alarm times.
+		alarmtimer_suspend_flag_clear();
+		alarmtimer_busy_flag_set();
+        #endif /* VENDOR_EDIT */
+
 		return -EBUSY;
 	}
 
@@ -299,6 +328,14 @@ static int alarmtimer_suspend(struct device *dev)
 	now = rtc_tm_to_ktime(tm);
 	now = ktime_add(now, min);
 
+	time = rtc_ktime_to_tm(now);
+	pr_notice_ratelimited("%s convert %lld to %04d/%02d/%02d %02d:%02d:%02d (now = %04d/%02d/%02d %02d:%02d:%02d)\n",
+			__func__, expires,
+			time.tm_year+1900, time.tm_mon+1, time.tm_mday,
+			time.tm_hour, time.tm_min, time.tm_sec,
+			tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+			tm.tm_hour, tm.tm_min, tm.tm_sec);
+
 	/* Set alarm, if in the past reject suspend briefly to handle */
 	ret = rtc_timer_start(rtc, &rtctimer, now, 0);
 	if (ret < 0)
@@ -309,10 +346,15 @@ static int alarmtimer_suspend(struct device *dev)
 static int alarmtimer_resume(struct device *dev)
 {
 	struct rtc_device *rtc;
+    #ifdef VENDOR_EDIT
+	//Nanwei.Deng@Kernel.Driver, 2018/11/19, add for analysis power coumption. count alarm times.
+	alarmtimer_suspend_flag_clear();
+    #endif /*VENDOR_EDIT*/
 
 	rtc = alarmtimer_get_rtcdev();
 	if (rtc)
-		rtc_timer_cancel(rtc, &rtctimer);
+		rtc_timer_cancel(rtc, &rtctimer);		
+
 	return 0;
 }
 
@@ -337,6 +379,9 @@ __alarm_init(struct alarm *alarm, enum alarmtimer_type type,
 	alarm->function = function;
 	alarm->type = type;
 	alarm->state = ALARMTIMER_STATE_INACTIVE;
+#ifdef VENDOR_EDIT
+  	memset(alarm->comm, 0, sizeof(alarm->comm));
+#endif /* VENDOR_EDIT */
 }
 
 /**
@@ -369,7 +414,9 @@ void alarm_start(struct alarm *alarm, ktime_t start)
 	alarmtimer_enqueue(base, alarm);
 	hrtimer_start(&alarm->timer, alarm->node.expires, HRTIMER_MODE_ABS);
 	spin_unlock_irqrestore(&base->lock, flags);
-
+#ifdef VENDOR_EDIT
+	memcpy(alarm->comm, current->comm, TASK_COMM_LEN);//get this alarm's owner
+#endif /* VENDOR_EDIT */
 	trace_alarmtimer_start(alarm, base->gettime());
 }
 EXPORT_SYMBOL_GPL(alarm_start);
@@ -476,35 +523,11 @@ u64 alarm_forward(struct alarm *alarm, ktime_t now, ktime_t interval)
 }
 EXPORT_SYMBOL_GPL(alarm_forward);
 
-static u64 __alarm_forward_now(struct alarm *alarm, ktime_t interval, bool throttle)
-{
-	struct alarm_base *base = &alarm_bases[alarm->type];
-	ktime_t now = base->gettime();
-
-	if (IS_ENABLED(CONFIG_HIGH_RES_TIMERS) && throttle) {
-		/*
-		 * Same issue as with posix_timer_fn(). Timers which are
-		 * periodic but the signal is ignored can starve the system
-		 * with a very small interval. The real fix which was
-		 * promised in the context of posix_timer_fn() never
-		 * materialized, but someone should really work on it.
-		 *
-		 * To prevent DOS fake @now to be 1 jiffie out which keeps
-		 * the overrun accounting correct but creates an
-		 * inconsistency vs. timer_gettime(2).
-		 */
-		ktime_t kj = NSEC_PER_SEC / HZ;
-
-		if (interval < kj)
-			now = ktime_add(now, kj);
-	}
-
-	return alarm_forward(alarm, now, interval);
-}
-
 u64 alarm_forward_now(struct alarm *alarm, ktime_t interval)
 {
-	return __alarm_forward_now(alarm, interval, false);
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	return alarm_forward(alarm, base->gettime(), interval);
 }
 EXPORT_SYMBOL_GPL(alarm_forward_now);
 
@@ -578,10 +601,9 @@ static enum alarmtimer_restart alarm_handle_timer(struct alarm *alarm,
 	if (posix_timer_event(ptr, si_private) && ptr->it_interval) {
 		/*
 		 * Handle ignored signals and rearm the timer. This will go
-		 * away once we handle ignored signals proper. Ensure that
-		 * small intervals cannot starve the system.
+		 * away once we handle ignored signals proper.
 		 */
-		ptr->it_overrun += __alarm_forward_now(alarm, ptr->it_interval, true);
+		ptr->it_overrun += alarm_forward_now(alarm, ptr->it_interval);
 		++ptr->it_requeue_pending;
 		ptr->it_active = 1;
 		result = ALARMTIMER_RESTART;
@@ -847,9 +869,9 @@ static int alarm_timer_nsleep(const clockid_t which_clock, int flags,
 	if (flags == TIMER_ABSTIME)
 		return -ERESTARTNOHAND;
 
+	restart->fn = alarm_timer_nsleep_restart;
 	restart->nanosleep.clockid = type;
 	restart->nanosleep.expires = exp;
-	set_restart_fn(restart, alarm_timer_nsleep_restart);
 	return ret;
 }
 
