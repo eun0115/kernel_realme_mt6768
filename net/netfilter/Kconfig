@@ -75,7 +75,7 @@ config NF_CONNTRACK_MARK
 config NF_CONNTRACK_SECMARK
 	bool  'Connection tracking security mark support'
 	depends on NETWORK_SECMARK
-	default y if NETFILTER_ADVANCED=n
+	default m if NETFILTER_ADVANCED=n
 	help
 	  This option enables security markings to be applied to
 	  connections.  Typically they are copied to connections from
@@ -100,6 +100,7 @@ config NF_CONNTRACK_ZONES
 
 config NF_CONNTRACK_PROCFS
 	bool "Supply CT list in procfs (OBSOLETE)"
+	default y
 	depends on PROC_FS
 	---help---
 	This option enables for the list of known conntrack entries
@@ -865,6 +866,21 @@ config NETFILTER_XT_TARGET_LOG
 	  any iptables table which records the packet header to the syslog.
 
 	  To compile it as a module, choose M here.  If unsure, say N.
+
+#ifdef OPLUS_FEATURE_WIFI_LIMMITBGSPEED
+#HuangJunyuan@CONNECTIVITY.WIFI.INTERNET, 2018/06/26, Add for limit speed function
+config NETFILTER_XT_TARGET_IMQ
+    tristate '"IMQ" target support'
+	depends on NETFILTER_XTABLES
+	depends on IP_NF_MANGLE || IP6_NF_MANGLE
+	select IMQ
+	default y
+        help
+          This option adds a `IMQ' target which is used to specify if and
+          to which imq device packets should get enqueued/dequeued.
+
+          To compile it as a module, choose M here.  If unsure, say N.
+#endif /* OPLUS_FEATURE_WIFI_LIMMITBGSPEED */
 
 config NETFILTER_XT_TARGET_MARK
 	tristate '"MARK" target support'

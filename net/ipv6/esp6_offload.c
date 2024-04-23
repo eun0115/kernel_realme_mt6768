@@ -49,8 +49,8 @@ static __u16 esp6_nexthdr_esp_offset(struct ipv6hdr *ipv6_hdr, int nhlen)
 	return 0;
 }
 
-static struct sk_buff **esp6_gro_receive(struct sk_buff **head,
-					 struct sk_buff *skb)
+static struct sk_buff *esp6_gro_receive(struct list_head *head,
+					struct sk_buff *skb)
 {
 	int offset = skb_gro_offset(skb);
 	struct xfrm_offload *xo;
@@ -304,9 +304,6 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 
 	secpath_reset(skb);
 
-	if (skb_needs_linearize(skb, skb->dev->features) &&
-	    __skb_linearize(skb))
-		return -ENOMEM;
 	return 0;
 }
 

@@ -125,7 +125,7 @@ struct uncached_list {
 
 static DEFINE_PER_CPU_ALIGNED(struct uncached_list, rt6_uncached_list);
 
-static void rt6_uncached_list_add(struct rt6_info *rt)
+void rt6_uncached_list_add(struct rt6_info *rt)
 {
 	struct uncached_list *ul = raw_cpu_ptr(&rt6_uncached_list);
 
@@ -136,7 +136,7 @@ static void rt6_uncached_list_add(struct rt6_info *rt)
 	spin_unlock_bh(&ul->lock);
 }
 
-static void rt6_uncached_list_del(struct rt6_info *rt)
+void rt6_uncached_list_del(struct rt6_info *rt)
 {
 	if (!list_empty(&rt->rt6i_uncached)) {
 		struct uncached_list *ul = rt->rt6i_uncached_list;
@@ -1498,6 +1498,14 @@ static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
 	if (confirm_neigh)
 		dst_confirm_neigh(dst, daddr);
 
+#ifdef OPLUS_BUG_STABILITY
+	//Huang.junyuan@PSW.CN.WiFi.Network.internet, 2020/06/08,
+	//ipv6 RFC8201 test
+	if (mtu < IPV6_MIN_MTU) {
+		return;
+	}
+#endif /* OPLUS_BUG_STABILITY */
+
 	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
 	if (mtu >= dst_mtu(dst))
 		return;
@@ -2604,6 +2612,30 @@ struct rt6_info *rt6_get_dflt_router(const struct in6_addr *addr, struct net_dev
 	return rt;
 }
 
+struct rt6_info *rt6_get_dflt_router_expires(struct net_device *dev)
+{
+	struct rt6_info *rt;
+	struct fib6_table *table;
+	#define RTF_ADGE (RTF_ADDRCONF | RTF_DEFAULT \
+		| RTF_GATEWAY | RTF_EXPIRES)
+
+	table = fib6_get_table(dev_net(dev),
+			       addrconf_rt_table(dev, RT6_TABLE_MAIN));
+	if (!table)
+		return NULL;
+
+	read_lock_bh(&table->tb6_lock);
+	for (rt = table->tb6_root.leaf; rt; rt = rt->dst.rt6_next) {
+		if (dev == rt->dst.dev &&
+		    ((rt->rt6i_flags & RTF_ADGE) == RTF_ADGE))
+			break;
+	}
+	if (rt)
+		dst_hold(&rt->dst);
+	read_unlock_bh(&table->tb6_lock);
+	return rt;
+}
+
 struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
 				     struct net_device *dev,
 				     unsigned int pref)
@@ -3155,19 +3187,6 @@ static void ip6_route_mpath_notify(struct rt6_info *rt,
 		inet6_rt_notify(RTM_NEWROUTE, rt, info, nlflags);
 }
 
-static int fib6_gw_from_attr(struct in6_addr *gw, struct nlattr *nla,
-			     struct netlink_ext_ack *extack)
-{
-	if (nla_len(nla) < sizeof(*gw)) {
-		NL_SET_ERR_MSG(extack, "Invalid IPv6 address in RTA_GATEWAY");
-		return -EINVAL;
-	}
-
-	*gw = nla_get_in6_addr(nla);
-
-	return 0;
-}
-
 static int ip6_route_multipath_add(struct fib6_config *cfg,
 				   struct netlink_ext_ack *extack)
 {
@@ -3208,11 +3227,7 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 
 			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
 			if (nla) {
-				err = fib6_gw_from_attr(&r_cfg.fc_gateway, nla,
-							extack);
-				if (err)
-					goto cleanup;
-
+				r_cfg.fc_gateway = nla_get_in6_addr(nla);
 				r_cfg.fc_flags |= RTF_GATEWAY;
 			}
 			r_cfg.fc_encap = nla_find(attrs, attrlen, RTA_ENCAP);
@@ -3272,11 +3287,9 @@ static int ip6_route_multipath_add(struct fib6_config *cfg,
 		 * nexthops have been replaced by first new, the rest should
 		 * be added to it.
 		 */
-		if (cfg->fc_nlinfo.nlh) {
-			cfg->fc_nlinfo.nlh->nlmsg_flags &= ~(NLM_F_EXCL |
-							     NLM_F_REPLACE);
-			cfg->fc_nlinfo.nlh->nlmsg_flags |= NLM_F_CREATE;
-		}
+		cfg->fc_nlinfo.nlh->nlmsg_flags &= ~(NLM_F_EXCL |
+						     NLM_F_REPLACE);
+		cfg->fc_nlinfo.nlh->nlmsg_flags |= NLM_F_CREATE;
 		nhn++;
 	}
 
@@ -3335,13 +3348,7 @@ static int ip6_route_multipath_del(struct fib6_config *cfg,
 
 			nla = nla_find(attrs, attrlen, RTA_GATEWAY);
 			if (nla) {
-				err = fib6_gw_from_attr(&r_cfg.fc_gateway, nla,
-							extack);
-				if (err) {
-					last_err = err;
-					goto next_rtnh;
-				}
-
+				nla_memcpy(&r_cfg.fc_gateway, nla, 16);
 				r_cfg.fc_flags |= RTF_GATEWAY;
 			}
 		}
@@ -3349,7 +3356,6 @@ static int ip6_route_multipath_del(struct fib6_config *cfg,
 		if (err)
 			last_err = err;
 
-next_rtnh:
 		rtnh = rtnh_next(rtnh, &remaining);
 	}
 
