@@ -40,8 +40,10 @@ static unsigned long glb_lpj_ref_freq;
 static int cpufreq_callback(struct notifier_block *nb,
 			    unsigned long val, void *data)
 {
-	int cpu;
 	struct cpufreq_freqs *freq = data;
+	struct cpumask *cpus = freq->policy->cpus;
+	unsigned long lpj;
+	int cpu;
 
 	/*
 	 * Skip lpj numbers adjustment if the CPU-freq transition is safe for
@@ -62,7 +64,6 @@ static int cpufreq_callback(struct notifier_block *nb,
 		}
 	}
 
-	cpu = freq->cpu;
 	/*
 	 * Adjust global lpj variable and per-CPU udelay_val number in
 	 * accordance with the new CPU frequency.
@@ -73,8 +74,12 @@ static int cpufreq_callback(struct notifier_block *nb,
 						glb_lpj_ref_freq,
 						freq->new);
 
-		cpu_data[cpu].udelay_val = cpufreq_scale(per_cpu(pcp_lpj_ref, cpu),
-					   per_cpu(pcp_lpj_ref_freq, cpu), freq->new);
+		for_each_cpu(cpu, cpus) {
+			lpj = cpufreq_scale(per_cpu(pcp_lpj_ref, cpu),
+					    per_cpu(pcp_lpj_ref_freq, cpu),
+					    freq->new);
+			cpu_data[cpu].udelay_val = (unsigned int)lpj;
+		}
 	}
 
 	return NOTIFY_OK;
@@ -155,10 +160,15 @@ static __init int cpu_has_mfc0_count_bug(void)
 	case CPU_R4400MC:
 		/*
 		 * The published errata for the R4400 up to 3.0 say the CPU
-		 * has the mfc0 from count bug.  This seems the last version
-		 * produced.
+		 * has the mfc0 from count bug.
 		 */
-		return 1;
+		if ((current_cpu_data.processor_id & 0xff) <= 0x30)
+			return 1;
+
+		/*
+		 * we assume newer revisions are ok
+		 */
+		return 0;
 	}
 
 	return 0;

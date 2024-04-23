@@ -74,21 +74,18 @@
 
 	.macro kernel_ventry, el, label, regsize = 64
 	.align 7
-.Lventry_start\@:
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+alternative_if ARM64_UNMAP_KERNEL_AT_EL0
 	.if	\el == 0
-	/*
-	 * This must be the first instruction of the EL0 vector entries. It is
-	 * skipped by the trampoline vectors, to trigger the cleanup.
-	 */
-	b	.Lskip_tramp_vectors_cleanup\@
 	.if	\regsize == 64
 	mrs	x30, tpidrro_el0
 	msr	tpidrro_el0, xzr
 	.else
 	mov	x30, xzr
 	.endif
-.Lskip_tramp_vectors_cleanup\@:
 	.endif
+alternative_else_nop_endif
+#endif
 
 	sub	sp, sp, #S_FRAME_SIZE
 #ifdef CONFIG_VMAP_STACK
@@ -134,15 +131,11 @@
 	mrs	x0, tpidrro_el0
 #endif
 	b	el\()\el\()_\label
-.org .Lventry_start\@ + 128	// Did we overflow the ventry slot?
 	.endm
 
-	.macro tramp_alias, dst, sym, tmp
+	.macro tramp_alias, dst, sym
 	mov_q	\dst, TRAMP_VALIAS
-	adr_l	\tmp, \sym
-	add	\dst, \dst, \tmp
-	adr_l	\tmp, .entry.tramp.text
-	sub	\dst, \dst, \tmp
+	add	\dst, \dst, #(\sym - .entry.tramp.text)
 	.endm
 
 	// This macro corrupts x0-x3. It is the caller's duty
@@ -368,25 +361,21 @@ alternative_else_nop_endif
 	ldp	x24, x25, [sp, #16 * 12]
 	ldp	x26, x27, [sp, #16 * 13]
 	ldp	x28, x29, [sp, #16 * 14]
-
-	.if	\el == 0
-alternative_if_not ARM64_UNMAP_KERNEL_AT_EL0
 	ldr	lr, [sp, #S_LR]
 	add	sp, sp, #S_FRAME_SIZE		// restore sp
-	eret
-alternative_else_nop_endif
+
+	.if	\el == 0
+alternative_insn eret, nop, ARM64_UNMAP_KERNEL_AT_EL0
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
 	bne	4f
-	msr	far_el1, x29
-	tramp_alias	x30, tramp_exit_native, x29
+	msr	far_el1, x30
+	tramp_alias	x30, tramp_exit_native
 	br	x30
 4:
-	tramp_alias	x30, tramp_exit_compat, x29
+	tramp_alias	x30, tramp_exit_compat
 	br	x30
 #endif
 	.else
-	ldr	lr, [sp, #S_LR]
-	add	sp, sp, #S_FRAME_SIZE		// restore sp
 	eret
 	.endif
 	.endm
@@ -582,6 +571,28 @@ ENDPROC(el1_error_invalid)
 	.align	6
 el1_sync:
 	kernel_entry 1
+	mov	x0, sp
+	get_thread_info x20	// top of stack
+	ldr	w4, [x20, #TI_CPU_EXCP]
+	add	w4, w4, #0x1
+	str	w4, [x20, #TI_CPU_EXCP]
+	cmp	w4, #0x1
+	b.ne	el1_sync_nest
+	str	x0, [x20, #TI_REGS_ON_EXCP]
+el1_sync_nest:
+	mrs	x1, esr_el1			// read the syndrome register
+	lsr	x24, x1, #ESR_ELx_EC_SHIFT	// exception class
+	cmp	x24, #ESR_ELx_EC_DABT_CUR	// data abort in EL1
+	b.ne	el1_sync_nest_skip_dec
+	sub	w4, w4, #0x1
+	str	w4, [x20, #TI_CPU_EXCP]
+el1_sync_nest_skip_dec:
+	cmp	w4, #0x2
+	b.lt	el1_sync_nest_skip
+#ifdef CONFIG_MTK_AEE_IPANIC
+	bl	aee_stop_nested_panic
+#endif
+el1_sync_nest_skip:
 	mrs	x1, esr_el1			// read the syndrome register
 	lsr	x24, x1, #ESR_ELx_EC_SHIFT	// exception class
 	cmp	x24, #ESR_ELx_EC_DABT_CUR	// data abort in EL1
@@ -617,6 +628,13 @@ el1_da:
 	untagged_addr x0, x3
 	mov	x2, sp				// struct pt_regs
 	bl	do_mem_abort
+	cmp	x24, #ESR_ELx_EC_DABT_CUR	// data abort in EL1
+	b.eq	el1_da_nest_skip_dec
+	get_thread_info x20	// top of stack
+	ldr	w4, [x20, #TI_CPU_EXCP]
+	sub	w4, w4, #0x1
+	str	w4, [x20, #TI_CPU_EXCP]
+el1_da_nest_skip_dec:
 
 	// disable interrupts before pulling preserved data off the stack
 	disable_irq
@@ -637,7 +655,11 @@ el1_undef:
 	enable_dbg
 	mov	x0, sp
 	bl	do_undefinstr
-	ASM_BUG()
+	get_thread_info x20     // top of stack
+	ldr	w4, [x20, #TI_CPU_EXCP]
+	sub	w4, w4, #0x1
+	str	w4, [x20, #TI_CPU_EXCP]
+	kernel_exit 1
 el1_dbg:
 	/*
 	 * Debug exception handling
@@ -648,6 +670,11 @@ el1_dbg:
 	mrs	x0, far_el1
 	mov	x2, sp				// struct pt_regs
 	bl	do_debug_exception
+	get_thread_info x20	// top of stack
+	ldr	w4, [x20, #TI_CPU_EXCP]
+	sub	w4, w4, #0x1
+	str	w4, [x20, #TI_CPU_EXCP]
+
 	kernel_exit 1
 el1_inv:
 	// TODO: add support for undefined instructions in kernel mode
@@ -959,7 +986,13 @@ el0_svc_naked:					// compat entry point
 	cmp     wscno, wsc_nr			// check upper syscall limit
 	b.hs	ni_sys
 	mask_nospec64 xscno, xsc_nr, x19	// enforce bounds for syscall number
+#ifdef VENDOR_EDIT
+#ifdef CONFIG_OPLUS_ROOT_CHECK
+	adr x16, oplus_root_check
+#else	
 	ldr	x16, [stbl, xscno, lsl #3]	// address in the syscall table
+#endif /* CONFIG_OPLUS_ROOT_CHECK */
+#endif /* VENDOR_EDIT */
 	blr	x16				// call sys_* routine
 	b	ret_fast_syscall
 ni_sys:
@@ -989,7 +1022,13 @@ __sys_trace:
 	ldp	x2, x3, [sp, #S_X2]
 	ldp	x4, x5, [sp, #S_X4]
 	ldp	x6, x7, [sp, #S_X6]
+#ifdef VENDOR_EDIT
+#ifdef CONFIG_OPLUS_ROOT_CHECK
+	adr x16, oplus_root_check
+#else
 	ldr	x16, [stbl, xscno, lsl #3]	// address in the syscall table
+#endif /* CONFIG_OPLUS_ROOT_CHECK */
+#endif /* VENDOR_EDIT */
 	blr	x16				// call sys_* routine
 
 __sys_trace_return:
@@ -1006,7 +1045,12 @@ __ni_sys_trace:
 
 	.popsection				// .entry.text
 
-	// Move from tramp_pg_dir to swapper_pg_dir
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+/*
+ * Exception vectors trampoline.
+ */
+	.pushsection ".entry.tramp.text", "ax"
+
 	.macro tramp_map_kernel, tmp
 	mrs	\tmp, ttbr1_el1
 	sub	\tmp, \tmp, #(SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE)
@@ -1038,47 +1082,12 @@ alternative_else_nop_endif
 	 */
 	.endm
 
-	.macro tramp_data_page	dst
-	adr_l	\dst, .entry.tramp.text
-	sub	\dst, \dst, PAGE_SIZE
-	.endm
-
-	.macro tramp_data_read_var	dst, var
-#ifdef CONFIG_RANDOMIZE_BASE
-	tramp_data_page		\dst
-	add	\dst, \dst, #:lo12:__entry_tramp_data_\var
-	ldr	\dst, [\dst]
-#else
-	ldr	\dst, =\var
-#endif
-	.endm
-
-#define BHB_MITIGATION_NONE	0
-#define BHB_MITIGATION_LOOP	1
-#define BHB_MITIGATION_FW	2
-#define BHB_MITIGATION_INSN	3
-
-	.macro tramp_ventry, vector_start, regsize, kpti, bhb
+	.macro tramp_ventry, regsize = 64
 	.align	7
 1:
 	.if	\regsize == 64
 	msr	tpidrro_el0, x30	// Restored in kernel_ventry
 	.endif
-
-	.if	\bhb == BHB_MITIGATION_LOOP
-	/*
-	 * This sequence must appear before the first indirect branch. i.e. the
-	 * ret out of tramp_ventry. It appears here because x30 is free.
-	 */
-	__mitigate_spectre_bhb_loop	x30
-	.endif // \bhb == BHB_MITIGATION_LOOP
-
-	.if	\bhb == BHB_MITIGATION_INSN
-	clearbhb
-	isb
-	.endif // \bhb == BHB_MITIGATION_INSN
-
-	.if	\kpti == 1
 	/*
 	 * Defend against branch aliasing attacks by pushing a dummy
 	 * entry onto the return stack and using a RET instruction to
@@ -1088,75 +1097,43 @@ alternative_else_nop_endif
 	b	.
 2:
 	tramp_map_kernel	x30
+#ifdef CONFIG_RANDOMIZE_BASE
+	adr	x30, tramp_vectors + PAGE_SIZE
 alternative_insn isb, nop, ARM64_WORKAROUND_QCOM_FALKOR_E1003
-	tramp_data_read_var	x30, vectors
-	prfm	plil1strm, [x30, #(1b - \vector_start)]
-	msr	vbar_el1, x30
-	isb
-	.else
+	ldr	x30, [x30]
+#else
 	ldr	x30, =vectors
-	.endif // \kpti == 1
-
-	.if	\bhb == BHB_MITIGATION_FW
-	/*
-	 * The firmware sequence must appear before the first indirect branch.
-	 * i.e. the ret out of tramp_ventry. But it also needs the stack to be
-	 * mapped to save/restore the registers the SMC clobbers.
-	 */
-	__mitigate_spectre_bhb_fw
-	.endif // \bhb == BHB_MITIGATION_FW
-
-	add	x30, x30, #(1b - \vector_start + 4)
+#endif
+	prfm	plil1strm, [x30, #(1b - tramp_vectors)]
+	msr	vbar_el1, x30
+	add	x30, x30, #(1b - tramp_vectors)
+	isb
 	ret
-.org 1b + 128	// Did we overflow the ventry slot?
 	.endm
 
 	.macro tramp_exit, regsize = 64
-	tramp_data_read_var	x30, this_cpu_vector
-alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
-	mrs	x29, tpidr_el1
-alternative_else
-	mrs	x29, tpidr_el2
-alternative_endif
-	ldr	x30, [x30, x29]
-
+	adr	x30, tramp_vectors
 	msr	vbar_el1, x30
-	ldr	lr, [sp, #S_LR]
-	tramp_unmap_kernel	x29
+	tramp_unmap_kernel	x30
 	.if	\regsize == 64
-	mrs	x29, far_el1
+	mrs	x30, far_el1
 	.endif
-	add	sp, sp, #S_FRAME_SIZE		// restore sp
 	eret
 	.endm
 
-	.macro	generate_tramp_vector,	kpti, bhb
-.Lvector_start\@:
-	.space	0x400
-
-	.rept	4
-	tramp_ventry	.Lvector_start\@, 64, \kpti, \bhb
-	.endr
-	.rept	4
-	tramp_ventry	.Lvector_start\@, 32, \kpti, \bhb
-	.endr
-	.endm
-
-#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
-/*
- * Exception vectors trampoline.
- * The order must match __bp_harden_el1_vectors and the
- * arm64_bp_harden_el1_vectors enum.
- */
-	.pushsection ".entry.tramp.text", "ax"
 	.align	11
 ENTRY(tramp_vectors)
-#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
-	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_LOOP
-	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_FW
-	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_INSN
-#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
-	generate_tramp_vector	kpti=1, bhb=BHB_MITIGATION_NONE
+	.space	0x400
+
+	tramp_ventry
+	tramp_ventry
+	tramp_ventry
+	tramp_ventry
+
+	tramp_ventry	32
+	tramp_ventry	32
+	tramp_ventry	32
+	tramp_ventry	32
 END(tramp_vectors)
 
 ENTRY(tramp_exit_native)
@@ -1174,53 +1151,10 @@ END(tramp_exit_compat)
 	.align PAGE_SHIFT
 	.globl	__entry_tramp_data_start
 __entry_tramp_data_start:
-__entry_tramp_data_vectors:
 	.quad	vectors
-#ifdef CONFIG_ARM_SDE_INTERFACE
-__entry_tramp_data___sdei_asm_trampoline_next_handler:
-	.quad	__sdei_asm_handler
-#endif /* CONFIG_ARM_SDE_INTERFACE */
-__entry_tramp_data_this_cpu_vector:
-	.quad	this_cpu_vector
 	.popsection				// .rodata
 #endif /* CONFIG_RANDOMIZE_BASE */
 #endif /* CONFIG_UNMAP_KERNEL_AT_EL0 */
-
-/*
- * Exception vectors for spectre mitigations on entry from EL1 when
- * kpti is not in use.
- */
-	.macro generate_el1_vector, bhb
-.Lvector_start\@:
-	kernel_ventry	1, sync_invalid			// Synchronous EL1t
-	kernel_ventry	1, irq_invalid			// IRQ EL1t
-	kernel_ventry	1, fiq_invalid			// FIQ EL1t
-	kernel_ventry	1, error_invalid		// Error EL1t
-
-	kernel_ventry	1, sync				// Synchronous EL1h
-	kernel_ventry	1, irq				// IRQ EL1h
-	kernel_ventry	1, fiq_invalid			// FIQ EL1h
-	kernel_ventry	1, error_invalid		// Error EL1h
-
-	.rept	4
-	tramp_ventry	.Lvector_start\@, 64, 0, \bhb
-	.endr
-	.rept 4
-	tramp_ventry	.Lvector_start\@, 32, 0, \bhb
-	.endr
-	.endm
-
-/* The order must match tramp_vecs and the arm64_bp_harden_el1_vectors enum. */
-	.pushsection ".entry.text", "ax"
-	.align	11
-ENTRY(__bp_harden_el1_vectors)
-#ifdef CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY
-	generate_el1_vector	bhb=BHB_MITIGATION_LOOP
-	generate_el1_vector	bhb=BHB_MITIGATION_FW
-	generate_el1_vector	bhb=BHB_MITIGATION_INSN
-#endif /* CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY */
-END(__bp_harden_el1_vectors)
-	.popsection
 
 /*
  * Special system call wrappers.

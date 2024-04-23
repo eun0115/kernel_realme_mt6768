@@ -16,6 +16,7 @@ config ARM64
 	select ARCH_HAS_GCOV_PROFILE_ALL
 	select ARCH_HAS_GIGANTIC_PAGE if (MEMORY_ISOLATION && COMPACTION) || CMA
 	select ARCH_HAS_KCOV
+	select ARCH_HAS_PTE_SPECIAL
 	select ARCH_HAS_SET_MEMORY
 	select ARCH_HAS_SG_CHAIN
 	select ARCH_HAS_STRICT_KERNEL_RWX
@@ -127,6 +128,7 @@ config ARM64
 	select SPARSE_IRQ
 	select SYSCTL_EXCEPTION_TRACE
 	select THREAD_INFO_IN_TASK
+	select ARCH_SUPPORTS_SPECULATIVE_PAGE_FAULT
 	help
 	  ARM 64-bit (AArch64) Linux support.
 
@@ -215,7 +217,8 @@ config GENERIC_CALIBRATE_DELAY
 	def_bool y
 
 config ZONE_DMA
-	def_bool y
+	bool "Support DMA zone" if EXPERT
+	default y
 
 config HAVE_GENERIC_GUP
 	def_bool y
@@ -453,7 +456,7 @@ config ARM64_ERRATUM_1024718
 	help
 	  This option adds work around for Arm Cortex-A55 Erratum 1024718.
 
-	  Affected Cortex-A55 cores (all revisions) could cause incorrect
+	  Affected Cortex-A55 cores (r0p0, r0p1, r1p0) could cause incorrect
 	  update of the hardware dirty bit when the DBM/AP bits are updated
 	  without a break-before-make. The work around is to disable the usage
 	  of hardware DBM locally on the affected cores. CPUs not affected by
@@ -461,35 +464,15 @@ config ARM64_ERRATUM_1024718
 
 	  If unsure, say Y.
 
-config ARM64_ERRATUM_1188873
-	bool "Cortex-A76: MRC read following MRRC read of specific Generic Timer in AArch32 might give incorrect result"
-	default y
-	depends on COMPAT
-	select ARM_ARCH_TIMER_OOL_WORKAROUND
+config ARM64_ERRATUM_1542418
+	bool "Cortex-A77: 1542418: The core might fetch a stale instruction from the L0 Macro-op"
+	default n
 	help
-	  This option adds work arounds for ARM Cortex-A76 erratum 1188873
+	  This option adds work around for Arm Cortex-A77 Erratum 1542418.
 
-	  Affected Cortex-A76 cores (r0p0, r1p0, r2p0) could cause
-	  register corruption when accessing the timer registers from
-	  AArch32 userspace.
-
-	  If unsure, say Y.
-
-config ARM64_ERRATUM_1742098
-	bool "Cortex-A57/A72: 1742098: ELR recorded incorrectly on interrupt taken between cryptographic instructions in a sequence"
-	depends on COMPAT
-	default y
-	help
-	  This option removes the AES hwcap for aarch32 user-space to
-	  workaround erratum 1742098 on Cortex-A57 and Cortex-A72.
-
-	  Affected parts may corrupt the AES state if an interrupt is
-	  taken between a pair of AES instructions. These instructions
-	  are only present if the cryptography extensions are present.
-	  All software should have a fallback implementation for CPUs
-	  that don't implement the cryptography extensions.
-
-	  If unsure, say Y.
+	  Affected Cortex-A77 cores (r0p0, r1p0) could cause the core might
+	  fetch a stale instructions from the L0 Macro-op cache which violates
+	  the ordefing of instruction fetches.
 
 config CAVIUM_ERRATUM_22375
 	bool "Cavium erratum 22375, 24313"
@@ -891,16 +874,6 @@ config ARM64_SSBD
 
 	  If unsure, say Y.
 
-config MITIGATE_SPECTRE_BRANCH_HISTORY
-	bool "Mitigate Spectre style attacks against branch history" if EXPERT
-	default y
-	depends on HARDEN_BRANCH_PREDICTOR || !KVM
-	help
-	  Speculation attacks against some high-performance processors can
-	  make use of branch history to influence future speculation.
-	  When taking an exception from user-space, a sequence of branches
-	  or a firmware call overwrites the branch history.
-
 config ARM64_TAGGED_ADDR_ABI
 	bool "Enable the tagged user addresses syscall ABI"
 	default y
@@ -1032,7 +1005,7 @@ config ARM64_LSE_ATOMICS
 
 config ARM64_VHE
 	bool "Enable support for Virtualization Host Extensions (VHE)"
-	default y
+	default n
 	help
 	  Virtualization Host Extensions (VHE) allow the kernel to run
 	  directly at EL2 (instead of EL1) on processors that support

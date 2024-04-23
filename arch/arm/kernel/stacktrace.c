@@ -51,18 +51,25 @@ int notrace unwind_frame(struct stackframe *frame)
 		return -EINVAL;
 
 	frame->sp = frame->fp;
-	frame->fp = READ_ONCE_NOCHECK(*(unsigned long *)(fp));
-	frame->pc = READ_ONCE_NOCHECK(*(unsigned long *)(fp + 4));
+	frame->fp = *(unsigned long *)(fp);
+	frame->pc = frame->lr;
+	frame->lr = *(unsigned long *)(fp + 4);
 #else
 	/* check current frame pointer is within bounds */
 	if (fp < low + 12 || fp > high - 4)
 		return -EINVAL;
 
 	/* restore the registers from the stack frame */
-	frame->fp = READ_ONCE_NOCHECK(*(unsigned long *)(fp - 12));
-	frame->sp = READ_ONCE_NOCHECK(*(unsigned long *)(fp - 8));
-	frame->pc = READ_ONCE_NOCHECK(*(unsigned long *)(fp - 4));
+	frame->fp = *(unsigned long *)(fp - 12);
+	frame->sp = *(unsigned long *)(fp - 8);
+	frame->pc = *(unsigned long *)(fp - 4);
 #endif
+
+	if (ALIGN(frame->fp, THREAD_SIZE) != ALIGN(fp, THREAD_SIZE))
+		return -EINVAL;
+
+	if (ALIGN(frame->sp, THREAD_SIZE) != ALIGN(low, THREAD_SIZE))
+		return -EINVAL;
 
 	return 0;
 }
@@ -142,6 +149,7 @@ static noinline void __save_stack_trace(struct task_struct *tsk,
 	data.no_sched_functions = nosched;
 
 	if (tsk != current) {
+#if 0
 #ifdef CONFIG_SMP
 		/*
 		 * What guarantees do we have here that 'tsk' is not
@@ -151,6 +159,7 @@ static noinline void __save_stack_trace(struct task_struct *tsk,
 		if (trace->nr_entries < trace->max_entries)
 			trace->entries[trace->nr_entries++] = ULONG_MAX;
 		return;
+#endif
 #else
 		frame.fp = thread_saved_fp(tsk);
 		frame.sp = thread_saved_sp(tsk);
