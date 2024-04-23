@@ -3,7 +3,6 @@
 #define _IPV6_H
 
 #include <uapi/linux/ipv6.h>
-#include <uapi/linux/icmpv6.h>
 
 #define ipv6_optlen(p)  (((p)->hdrlen+1) << 3)
 #define ipv6_authlen(p) (((p)->hdrlen+2) << 2)
@@ -14,6 +13,7 @@ struct ipv6_devconf {
 	__s32		forwarding;
 	__s32		hop_limit;
 	__s32		mtu6;
+	__s32		ra_mtu;
 	__s32		accept_ra;
 	__s32		accept_redirects;
 	__s32		autoconf;
@@ -84,6 +84,7 @@ struct ipv6_params {
 	__s32 autoconf;
 };
 extern struct ipv6_params ipv6_defaults;
+#include <linux/icmpv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 

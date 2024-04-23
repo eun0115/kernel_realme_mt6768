@@ -571,6 +571,16 @@ static inline int qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	return sch->enqueue(skb, sch, to_free);
 }
 
+#ifdef OPLUS_FEATURE_WIFI_LIMMITBGSPEED
+//HuangJunyuan@CONNECTIVITY.WIFI.INTERNET, 2018/06/26, Add for limit speed function
+static inline int qdisc_enqueue_root(struct sk_buff *skb, struct Qdisc *sch,
+				      struct sk_buff **to_free)
+{
+    qdisc_skb_cb(skb)->pkt_len = skb->len;
+    return qdisc_enqueue(skb, sch, to_free) & NET_XMIT_MASK;
+}
+#endif /* OPLUS_FEATURE_WIFI_LIMMITBGSPEED */
+
 static inline bool qdisc_is_percpu_stats(const struct Qdisc *q)
 {
 	return q->flags & TCQ_F_CPUSTATS;
@@ -885,7 +895,6 @@ struct psched_ratecfg {
 	u64	rate_bytes_ps; /* bytes per second */
 	u32	mult;
 	u16	overhead;
-	u16	mpu;
 	u8	linklayer;
 	u8	shift;
 };
@@ -894,9 +903,6 @@ static inline u64 psched_l2t_ns(const struct psched_ratecfg *r,
 				unsigned int len)
 {
 	len += r->overhead;
-
-	if (len < r->mpu)
-		len = r->mpu;
 
 	if (unlikely(r->linklayer == TC_LINKLAYER_ATM))
 		return ((u64)(DIV_ROUND_UP(len,48)*53) * r->mult) >> r->shift;
@@ -920,7 +926,6 @@ static inline void psched_ratecfg_getrate(struct tc_ratespec *res,
 	res->rate = min_t(u64, r->rate_bytes_ps, ~0U);
 
 	res->overhead = r->overhead;
-	res->mpu = r->mpu;
 	res->linklayer = (r->linklayer & TC_LINKLAYER_MASK);
 }
 

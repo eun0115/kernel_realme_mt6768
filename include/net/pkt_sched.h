@@ -109,6 +109,11 @@ int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
 
 void __qdisc_run(struct Qdisc *q);
 
+#ifdef OPLUS_FEATURE_WIFI_LIMMITBGSPEED
+//HuangJunyuan@CONNECTIVITY.WIFI.INTERNET, 2018/06/26, Add for limit speed function
+struct sk_buff *qdisc_dequeue_skb(struct Qdisc *q, bool *validate);
+#endif /* OPLUS_FEATURE_WIFI_LIMMITBGSPEED */
+
 static inline void qdisc_run(struct Qdisc *q)
 {
 	if (qdisc_run_begin(q))
@@ -126,14 +131,12 @@ static inline __be16 tc_skb_protocol(const struct sk_buff *skb)
 	return skb->protocol;
 }
 
-extern const struct nla_policy rtm_tca_policy[TCA_MAX + 1];
-
 /* Calculate maximal size of packet seen by hard_start_xmit
    routine of this device.
  */
 static inline unsigned int psched_mtu(const struct net_device *dev)
 {
-	return READ_ONCE(dev->mtu) + dev->hard_header_len;
+	return dev->mtu + dev->hard_header_len;
 }
 
 static inline bool is_classid_clsact_ingress(u32 classid)
