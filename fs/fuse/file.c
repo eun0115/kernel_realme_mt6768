@@ -7,6 +7,10 @@
 */
 
 #include "fuse_i.h"
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+#include "fuse_shortcircuit.h"
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -17,15 +21,18 @@
 #include <linux/swap.h>
 #include <linux/falloc.h>
 #include <linux/uio.h>
-#include <linux/fs.h>
 
 static const struct file_operations fuse_direct_io_file_operations;
-
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
-			  int opcode, struct fuse_open_out *outargp)
+			  int opcode, struct fuse_open_out *outargp,
+			  struct file **lower_file)
 {
+	ssize_t ret;
 	struct fuse_open_in inarg;
 	FUSE_ARGS(args);
+	char *iname = NULL;
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.flags = file->f_flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
@@ -40,8 +47,41 @@ static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	args.out.args[0].size = sizeof(*outargp);
 	args.out.args[0].value = outargp;
 
+	if (opcode == FUSE_OPEN)
+		iname = inode_name(file_inode(file));
+	args.iname = iname;
+
+	ret = fuse_simple_request(fc, &args);
+	if (args.iname)
+		__putname(args.iname);
+	if (args.private_lower_rw_file != NULL)
+		*lower_file = args.private_lower_rw_file;
+	return ret;
+}
+#else
+static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
+			  int opcode, struct fuse_open_out *outargp)
+{
+	struct fuse_open_in inarg;
+	FUSE_ARGS(args);
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.flags = file->f_flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
+
+	if (!fc->atomic_o_trunc)
+		inarg.flags &= ~O_TRUNC;
+	args.in.h.opcode = opcode;
+	args.in.h.nodeid = nodeid;
+	args.in.numargs = 1;
+	args.in.args[0].size = sizeof(inarg);
+	args.in.args[0].value = &inarg;
+	args.out.numargs = 1;
+	args.out.args[0].size = sizeof(*outargp);
+	args.out.args[0].value = outargp;
+
 	return fuse_simple_request(fc, &args);
 }
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 struct fuse_file *fuse_file_alloc(struct fuse_conn *fc)
 {
@@ -51,6 +91,10 @@ struct fuse_file *fuse_file_alloc(struct fuse_conn *fc)
 	if (unlikely(!ff))
 		return NULL;
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	ff->rw_lower_file = NULL;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	ff->fc = fc;
 	ff->reserved_req = fuse_request_alloc(0);
 	if (unlikely(!ff->reserved_req)) {
@@ -131,7 +175,13 @@ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 		struct fuse_open_out outarg;
 		int err;
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+		err = fuse_send_open(fc, nodeid, file, opcode, &outarg,
+				&(ff->rw_lower_file));
+#else
 		err = fuse_send_open(fc, nodeid, file, opcode, &outarg);
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 		if (!err) {
 			ff->fh = outarg.fh;
 			ff->open_flags = outarg.open_flags;
@@ -206,9 +256,6 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 			  fc->atomic_o_trunc &&
 			  fc->writeback_cache;
 
-	if (fuse_is_bad(inode))
-		return -EIO;
-
 	err = generic_file_open(inode, file);
 	if (err)
 		return err;
@@ -260,6 +307,10 @@ void fuse_release_common(struct file *file, bool isdir)
 	struct fuse_req *req = ff->reserved_req;
 	int opcode = isdir ? FUSE_RELEASEDIR : FUSE_RELEASE;
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	fuse_shortcircuit_release(ff);
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	fuse_prepare_release(ff, file->f_flags, opcode);
 
 	if (ff->flock) {
@@ -410,7 +461,7 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	struct fuse_flush_in inarg;
 	int err;
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	if (fc->no_flush)
@@ -458,7 +509,7 @@ int fuse_fsync_common(struct file *file, loff_t start, loff_t end,
 	struct fuse_fsync_in inarg;
 	int err;
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	inode_lock(inode);
@@ -773,7 +824,7 @@ static int fuse_readpage(struct file *file, struct page *page)
 	int err;
 
 	err = -EIO;
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		goto out;
 
 	err = fuse_do_readpage(file, page);
@@ -900,7 +951,7 @@ static int fuse_readpages(struct file *file, struct address_space *mapping,
 	int nr_alloc = min_t(unsigned, nr_pages, FUSE_MAX_PAGES_PER_REQ);
 
 	err = -EIO;
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		goto out;
 
 	data.file = file;
@@ -929,9 +980,11 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = iocb->ki_filp->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-
-	if (fuse_is_bad(inode))
-		return -EIO;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	struct fuse_file *ff = iocb->ki_filp->private_data;
+	ssize_t ret_val;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -945,8 +998,17 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (err)
 			return err;
 	}
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	if (ff && ff->rw_lower_file)
+		ret_val = fuse_shortcircuit_read_iter(iocb, to);
+	else
+		ret_val = generic_file_read_iter(iocb, to);
 
+	return ret_val;
+#else
 	return generic_file_read_iter(iocb, to);
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 }
 
 static void fuse_write_fill(struct fuse_req *req, struct fuse_file *ff,
@@ -1133,7 +1195,7 @@ static ssize_t fuse_perform_write(struct kiocb *iocb,
 	int err = 0;
 	ssize_t res = 0;
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	if (inode->i_size < pos + iov_iter_count(ii))
@@ -1184,14 +1246,27 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	struct fuse_file *ff = file->private_data;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	ssize_t written = 0;
 	ssize_t written_buffered = 0;
 	struct inode *inode = mapping->host;
 	ssize_t err;
 	loff_t endbyte = 0;
 
-	if (fuse_is_bad(inode))
-		return -EIO;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	if (ff && ff->rw_lower_file) {
+		/* Update size (EOF optimization) and mode (SUID clearing) */
+		err = fuse_update_attributes(mapping->host, file);
+		if (err)
+			return err;
+
+		return fuse_shortcircuit_write_iter(iocb, from);
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 	if (get_fuse_conn(inode)->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1325,7 +1400,6 @@ static int fuse_get_user_pages(struct fuse_req *req, struct iov_iter *ii,
 			(PAGE_SIZE - ret) & (PAGE_SIZE - 1);
 	}
 
-	req->user_pages = true;
 	if (write)
 		req->in.argpages = 1;
 	else
@@ -1430,7 +1504,7 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 	ssize_t res;
 	struct inode *inode = file_inode(io->iocb->ki_filp);
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	res = fuse_direct_io(io, iter, ppos, 0);
@@ -1452,7 +1526,7 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 	ssize_t res;
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	/* Don't allow parallel writes to the same file */
@@ -1489,7 +1563,7 @@ static void fuse_writepage_finish(struct fuse_conn *fc, struct fuse_req *req)
 	list_del(&req->writepages_entry);
 	for (i = 0; i < req->num_pages; i++) {
 		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-		dec_node_page_state(req->pages[i], NR_WRITEBACK_TEMP);
+		dec_node_page_state(req->pages[i], NR_WRITEBACK);
 		wb_writeout_inc(&bdi->wb);
 	}
 	wake_up(&fi->page_waitq);
@@ -1679,7 +1753,7 @@ static int fuse_writepage_locked(struct page *page)
 	req->inode = inode;
 
 	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
-	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
+	inc_node_page_state(tmp_page, NR_WRITEBACK);
 
 	spin_lock(&fc->lock);
 	list_add(&req->writepages_entry, &fi->writepages);
@@ -1795,7 +1869,7 @@ static bool fuse_writepage_in_flight(struct fuse_req *new_req,
 		spin_unlock(&fc->lock);
 
 		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-		dec_node_page_state(new_req->pages[0], NR_WRITEBACK_TEMP);
+		dec_node_page_state(new_req->pages[0], NR_WRITEBACK);
 		wb_writeout_inc(&bdi->wb);
 		fuse_writepage_free(fc, new_req);
 		fuse_request_free(new_req);
@@ -1894,7 +1968,7 @@ static int fuse_writepages_fill(struct page *page,
 	req->page_descs[req->num_pages].length = PAGE_SIZE;
 
 	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
-	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
+	inc_node_page_state(tmp_page, NR_WRITEBACK);
 
 	err = 0;
 	if (is_writeback && fuse_writepage_in_flight(req, page)) {
@@ -1926,7 +2000,7 @@ static int fuse_writepages(struct address_space *mapping,
 	int err;
 
 	err = -EIO;
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		goto out;
 
 	data.inode = inode;
@@ -2093,6 +2167,13 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	struct fuse_file *ff = file->private_data;
+
+	if (ff->rw_lower_file)
+		return fuse_shortcircuit_mmap(file, vma);
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
+
 	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
 		fuse_link_write_file(file);
 
@@ -2545,16 +2626,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		struct iovec *iov = iov_page;
 
 		iov->iov_base = (void __user *)arg;
-
-		switch (cmd) {
-		case FS_IOC_GETFLAGS:
-		case FS_IOC_SETFLAGS:
-			iov->iov_len = sizeof(int);
-			break;
-		default:
-			iov->iov_len = _IOC_SIZE(cmd);
-			break;
-		}
+		iov->iov_len = _IOC_SIZE(cmd);
 
 		if (_IOC_DIR(cmd) & _IOC_WRITE) {
 			in_iov = iov;
@@ -2711,7 +2783,7 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
 	if (!fuse_allow_current_process(fc))
 		return -EACCES;
 
-	if (fuse_is_bad(inode))
+	if (is_bad_inode(inode))
 		return -EIO;
 
 	return fuse_do_ioctl(file, cmd, arg, flags);
@@ -2770,7 +2842,7 @@ static void fuse_register_polled_file(struct fuse_conn *fc,
 {
 	spin_lock(&fc->lock);
 	if (RB_EMPTY_NODE(&ff->polled_node)) {
-		struct rb_node **link, *parent;
+		struct rb_node **link, *uninitialized_var(parent);
 
 		link = fuse_find_polled_node(fc, ff->kh, &parent);
 		BUG_ON(*link);

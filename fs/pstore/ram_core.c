@@ -36,6 +36,13 @@ struct persistent_ram_buffer {
 	uint8_t     data[0];
 };
 
+#ifdef __aarch64__
+#ifdef memcpy
+#undef memcpy
+#endif
+#define memcpy memcpy_toio
+#endif
+
 #define PERSISTENT_RAM_SIG (0x43474244) /* DBGC */
 
 static inline size_t buffer_size(struct persistent_ram_zone *prz)
@@ -418,11 +425,7 @@ static void *persistent_ram_vmap(phys_addr_t start, size_t size,
 		phys_addr_t addr = page_start + i * PAGE_SIZE;
 		pages[i] = pfn_to_page(addr >> PAGE_SHIFT);
 	}
-	/*
-	 * VM_IOREMAP used here to bypass this region during vread()
-	 * and kmap_atomic() (i.e. kcore) to avoid __va() failures.
-	 */
-	vaddr = vmap(pages, page_count, VM_MAP | VM_IOREMAP, prot);
+	vaddr = vmap(pages, page_count, VM_MAP, prot);
 	kfree(pages);
 
 	/*
@@ -492,7 +495,7 @@ static int persistent_ram_post_init(struct persistent_ram_zone *prz, u32 sig,
 	sig ^= PERSISTENT_RAM_SIG;
 
 	if (prz->buffer->sig == sig) {
-		if (buffer_size(prz) == 0 && buffer_start(prz) == 0) {
+		if (buffer_size(prz) == 0) {
 			pr_debug("found existing empty buffer\n");
 			return 0;
 		}

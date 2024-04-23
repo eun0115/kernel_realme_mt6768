@@ -7,6 +7,10 @@
 */
 
 #include "fuse_i.h"
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+#include "fuse_shortcircuit.h"
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -22,7 +26,6 @@
 #include <linux/swap.h>
 #include <linux/splice.h>
 #include <linux/sched.h>
-#include <linux/freezer.h>
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
@@ -100,6 +103,12 @@ void fuse_request_free(struct fuse_req *req)
 		kfree(req->pages);
 		kfree(req->page_descs);
 	}
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	if (req->iname) {
+		__putname(req->iname);
+		req->iname = NULL;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	kmem_cache_free(fuse_req_cachep, req);
 }
 
@@ -477,9 +486,7 @@ static void request_wait_answer(struct fuse_conn *fc, struct fuse_req *req)
 	 * Either request is already in userspace, or it was forced.
 	 * Wait it out.
 	 */
-	while (!test_bit(FR_FINISHED, &req->flags))
-		wait_event_freezable(req->waitq,
-				test_bit(FR_FINISHED, &req->flags));
+	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
 }
 
 static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
@@ -568,10 +575,21 @@ ssize_t fuse_simple_request(struct fuse_conn *fc, struct fuse_args *args)
 	       args->in.numargs * sizeof(struct fuse_in_arg));
 	req->out.argvar = args->out.argvar;
 	req->out.numargs = args->out.numargs;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	req->iname = args->iname;
+	args->iname = NULL;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	memcpy(req->out.args, args->out.args,
 	       args->out.numargs * sizeof(struct fuse_arg));
 	fuse_request_send(fc, req);
 	ret = req->out.h.error;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	if (!ret) {
+		if (req->private_lower_rw_file != NULL)
+			args->private_lower_rw_file = req->private_lower_rw_file;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	if (!ret && args->out.argvar) {
 		BUG_ON(args->out.numargs != 1);
 		ret = req->out.args[0].size;
@@ -772,7 +790,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 			if (cs->nr_segs == cs->pipe->buffers)
 				return -EIO;
 
-			page = alloc_page(GFP_HIGHUSER);
+			page = alloc_page(GFP_HIGHUSER & ~__GFP_FS);
 			if (!page)
 				return -ENOMEM;
 
@@ -828,6 +846,7 @@ static int fuse_check_page(struct page *page)
 {
 	if (page_mapcount(page) ||
 	    page->mapping != NULL ||
+	    page_count(page) != 1 ||
 	    (page->flags & PAGE_FLAGS_CHECK_AT_PREP &
 	     ~(1 << PG_locked |
 	       1 << PG_referenced |
@@ -849,16 +868,15 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	struct page *newpage;
 	struct pipe_buffer *buf = cs->pipebufs;
 
-	get_page(oldpage);
 	err = unlock_request(cs->req);
 	if (err)
-		goto out_put_old;
+		return err;
 
 	fuse_copy_finish(cs);
 
 	err = pipe_buf_confirm(cs->pipe, buf);
 	if (err)
-		goto out_put_old;
+		return err;
 
 	BUG_ON(!cs->nr_segs);
 	cs->currbuf = buf;
@@ -898,19 +916,13 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	err = replace_page_cache_page(oldpage, newpage, GFP_KERNEL);
 	if (err) {
 		unlock_page(newpage);
-		goto out_put_old;
+		return err;
 	}
 
 	get_page(newpage);
 
 	if (!(buf->flags & PIPE_BUF_FLAG_LRU))
 		lru_cache_add_file(newpage);
-
-	/*
-	 * Release while we have extra ref on stolen page.  Otherwise
-	 * anon_pipe_buf_release() might think the page can be reused.
-	 */
-	pipe_buf_release(cs->pipe, buf);
 
 	err = 0;
 	spin_lock(&cs->req->waitq.lock);
@@ -923,19 +935,14 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	if (err) {
 		unlock_page(newpage);
 		put_page(newpage);
-		goto out_put_old;
+		return err;
 	}
 
 	unlock_page(oldpage);
-	/* Drop ref for ap->pages[] array */
 	put_page(oldpage);
 	cs->len = 0;
 
-	err = 0;
-out_put_old:
-	/* Drop ref obtained in this function */
-	put_page(oldpage);
-	return err;
+	return 0;
 
 out_fallback_unlock:
 	unlock_page(newpage);
@@ -944,10 +951,10 @@ out_fallback:
 	cs->offset = buf->offset;
 
 	err = lock_request(cs->req);
-	if (!err)
-		err = 1;
+	if (err)
+		return err;
 
-	goto out_put_old;
+	return 1;
 }
 
 static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
@@ -959,16 +966,14 @@ static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
 	if (cs->nr_segs == cs->pipe->buffers)
 		return -EIO;
 
-	get_page(page);
 	err = unlock_request(cs->req);
-	if (err) {
-		put_page(page);
+	if (err)
 		return err;
-	}
 
 	fuse_copy_finish(cs);
 
 	buf = cs->pipebufs;
+	get_page(page);
 	buf->page = page;
 	buf->offset = offset;
 	buf->len = count;
@@ -995,17 +1000,7 @@ static int fuse_copy_page(struct fuse_copy_state *cs, struct page **pagep,
 
 	while (count) {
 		if (cs->write && cs->pipebufs && page) {
-			/*
-			 * Can't control lifetime of pipe buffers, so always
-			 * copy user pages.
-			 */
-			if (cs->req->user_pages) {
-				err = fuse_copy_fill(cs);
-				if (err)
-					return err;
-			} else {
-				return fuse_ref_page(cs, page, offset, count);
-			}
+			return fuse_ref_page(cs, page, offset, count);
 		} else if (!cs->len) {
 			if (cs->move_pages && page &&
 			    offset == 0 && count == PAGE_SIZE) {
@@ -1324,15 +1319,6 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		goto restart;
 	}
 	spin_lock(&fpq->lock);
-	/*
-	 *  Must not put request on fpq->io queue after having been shut down by
-	 *  fuse_abort_conn()
-	 */
-	if (!fpq->connected) {
-		req->out.h.error = err = -ECONNABORTED;
-		goto out_end;
-
-	}
 	list_add(&req->list, &fpq->io);
 	spin_unlock(&fpq->lock);
 	cs->req = req;
@@ -1359,6 +1345,24 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	__fuse_get_request(req);
 	set_bit(FR_SENT, &req->flags);
 	spin_unlock(&fpq->lock);
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	if (sct_mode == 1) {
+		if (current->fpack) {
+			if (current->fpack->iname)
+				__putname(current->fpack->iname);
+			memset(current->fpack, 0, sizeof(struct fuse_package));
+		}
+		if (req->in.h.opcode == FUSE_OPEN || req->in.h.opcode == FUSE_CREATE) {
+			if (!current->fpack)
+				current->fpack = kzalloc(sizeof(struct fuse_package), GFP_KERNEL);
+			if (likely(current->fpack)) {
+				current->fpack->fuse_open_req = true;
+				current->fpack->iname = req->iname;
+				req->iname = NULL;
+			}
+		}
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	/* matches barrier in request_wait_answer() */
 	smp_mb__after_atomic();
 	if (test_bit(FR_INTERRUPTED, &req->flags))
@@ -1888,6 +1892,13 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	struct fuse_req *req;
 	struct fuse_out_header oh;
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+	if (current->fpack && current->fpack->iname) {
+		__putname(current->fpack->iname);
+		current->fpack->iname = NULL;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
+
 	if (nbytes < sizeof(struct fuse_out_header))
 		return -EINVAL;
 
@@ -1909,7 +1920,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	}
 
 	err = -EINVAL;
-	if (oh.error <= -512 || oh.error > 0)
+	if (oh.error <= -1000 || oh.error > 0)
 		goto err_finish;
 
 	spin_lock(&fpq->lock);
@@ -1959,6 +1970,10 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 		req->out.h.error = kern_path(path, 0, req->canonical_path);
 	}
 	fuse_copy_finish(cs);
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	fuse_setup_shortcircuit(fc, req);
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 
 	spin_lock(&fpq->lock);
 	clear_bit(FR_LOCKED, &req->flags);
@@ -2072,12 +2087,8 @@ static ssize_t fuse_dev_splice_write(struct pipe_inode_info *pipe,
 
 	pipe_lock(pipe);
 out_free:
-	for (idx = 0; idx < nbuf; idx++) {
-		struct pipe_buffer *buf = &bufs[idx];
-
-		if (buf->ops)
-			pipe_buf_release(pipe, buf);
-	}
+	for (idx = 0; idx < nbuf; idx++)
+		pipe_buf_release(pipe, &bufs[idx]);
 	pipe_unlock(pipe);
 
 	kfree(bufs);

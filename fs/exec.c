@@ -72,6 +72,8 @@
 
 #include <trace/events/sched.h>
 
+#include <mt-plat/mtk_pidmap.h>
+
 int suid_dumpable = 0;
 
 static LIST_HEAD(formats);
@@ -311,7 +313,7 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	vma->vm_start = vma->vm_end - PAGE_SIZE;
 	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-	INIT_LIST_HEAD(&vma->anon_vma_chain);
+	INIT_VMA(vma);
 
 	err = insert_vm_struct(mm, vma);
 	if (err)
@@ -980,7 +982,7 @@ int kernel_read_file_from_fd(int fd, void **buf, loff_t *size, loff_t max_size,
 	struct fd f = fdget(fd);
 	int ret = -EBADF;
 
-	if (!f.file || !(f.file->f_mode & FMODE_READ))
+	if (!f.file)
 		goto out;
 
 	ret = kernel_read_file(f.file, buf, size, max_size, id);
@@ -1024,23 +1026,10 @@ static int exec_mmap(struct mm_struct *mm)
 		}
 	}
 	task_lock(tsk);
-
-	local_irq_disable();
 	active_mm = tsk->active_mm;
-	tsk->active_mm = mm;
 	tsk->mm = mm;
-	/*
-	 * This prevents preemption while active_mm is being loaded and
-	 * it and mm are being updated, which could cause problems for
-	 * lazy tlb mm refcounting when these are updated by context
-	 * switches. Not all architectures can handle irqs off over
-	 * activate_mm yet.
-	 */
-	if (!IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
-		local_irq_enable();
+	tsk->active_mm = mm;
 	activate_mm(active_mm, mm);
-	if (IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
-		local_irq_enable();
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
 	task_unlock(tsk);
@@ -1250,6 +1239,7 @@ void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
 	strlcpy(tsk->comm, buf, sizeof(tsk->comm));
 	task_unlock(tsk);
 	perf_event_comm(tsk, exec);
+	mtk_pidmap_update(tsk);
 }
 
 /*
@@ -1703,6 +1693,11 @@ static int exec_binprm(struct linux_binprm *bprm)
 	return ret;
 }
 
+#ifdef CONFIG_OPLUS_SECURE_GUARD
+#if defined(CONFIG_OPLUS_EXECVE_BLOCK) || defined(CONFIG_OPLUS_EXECVE_REPORT)
+extern int oplus_exec_block(struct file *file);
+#endif /* CONFIG_OPLUS_EXECVE_BLOCK or CONFIG_OPLUS_EXECVE_REPORT */
+#endif /* CONFIG_OPLUS_SECURE_GUARD */
 /*
  * sys_execve() executes a new program.
  */
@@ -1757,6 +1752,15 @@ static int do_execveat_common(int fd, struct filename *filename,
 	if (IS_ERR(file))
 		goto out_unmark;
 
+#ifdef CONFIG_OPLUS_SECURE_GUARD
+#if defined(CONFIG_OPLUS_EXECVE_BLOCK) || defined(CONFIG_OPLUS_EXECVE_REPORT)
+    retval = oplus_exec_block(file);
+	if (retval){
+		fput(file);
+		goto out_unmark;
+	}
+#endif /* CONFIG_OPLUS_EXECVE_BLOCK or CONFIG_OPLUS_EXECVE_REPORT */
+#endif /* CONFIG_OPLUS_SECURE_GUARD */
 	sched_exec();
 
 	bprm->file = file;
@@ -1788,9 +1792,6 @@ static int do_execveat_common(int fd, struct filename *filename,
 		goto out_unmark;
 
 	bprm->argc = count(argv, MAX_ARG_STRINGS);
-	if (bprm->argc == 0)
-		pr_warn_once("process '%s' launched '%s' with NULL argv: empty string added\n",
-			     current->comm, bprm->filename);
 	if ((retval = bprm->argc) < 0)
 		goto out;
 
@@ -1814,20 +1815,6 @@ static int do_execveat_common(int fd, struct filename *filename,
 	retval = copy_strings(bprm->argc, argv, bprm);
 	if (retval < 0)
 		goto out;
-
-	/*
-	 * When argv is empty, add an empty string ("") as argv[0] to
-	 * ensure confused userspace programs that start processing
-	 * from argv[1] won't end up walking envp. See also
-	 * bprm_stack_limits().
-	 */
-	if (bprm->argc == 0) {
-		const char *argv[] = { "", NULL };
-		retval = copy_strings_kernel(1, argv, bprm);
-		if (retval < 0)
-			goto out;
-		bprm->argc = 1;
-	}
 
 	retval = exec_binprm(bprm);
 	if (retval < 0)

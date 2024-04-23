@@ -117,8 +117,6 @@ enum {
 	FUSE_I_INIT_RDPLUS,
 	/** An operation changing file size is in progress  */
 	FUSE_I_SIZE_UNSTABLE,
-	/* Bad inode */
-	FUSE_I_BAD,
 };
 
 struct fuse_conn;
@@ -157,6 +155,12 @@ struct fuse_file {
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
+
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	/* the read write file */
+	struct file *rw_lower_file;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 };
 
 /** One input argument of a request */
@@ -237,6 +241,12 @@ struct fuse_args {
 		unsigned numargs;
 		struct fuse_arg args[2];
 	} out;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	/** fuse shortcircuit file  */
+	struct file *private_lower_rw_file;
+	char *iname;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 };
 
 #define FUSE_ARGS(args) struct fuse_args args = {}
@@ -312,8 +322,6 @@ struct fuse_req {
 	/** refcount */
 	refcount_t count;
 
-	bool user_pages;
-
 	/** Unique ID for the interrupt request */
 	u64 intr_unique;
 
@@ -388,6 +396,13 @@ struct fuse_req {
 
 	/** Request is stolen from fuse_file->reserved_req */
 	struct file *stolen_file;
+
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	/** fuse shortcircuit file  */
+	struct file *private_lower_rw_file;
+	char *iname;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 };
 
 struct fuse_iqueue {
@@ -548,6 +563,11 @@ struct fuse_conn {
 	/** handle fs handles killing suid/sgid/cap on write/chown/trunc */
 	unsigned handle_killpriv:1;
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+	/** Shortcircuited IO. */
+	unsigned shortcircuit_io:1;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 	/*
 	 * The following bitfields are only for optimization purposes
 	 * and hence races in setting them will not cause malfunction
@@ -692,17 +712,6 @@ static inline struct fuse_inode *get_fuse_inode(struct inode *inode)
 static inline u64 get_node_id(struct inode *inode)
 {
 	return get_fuse_inode(inode)->nodeid;
-}
-
-static inline void fuse_make_bad(struct inode *inode)
-{
-	remove_inode_hash(inode);
-	set_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state);
-}
-
-static inline bool fuse_is_bad(struct inode *inode)
-{
-	return unlikely(test_bit(FUSE_I_BAD, &get_fuse_inode(inode)->state));
 }
 
 /** Device operations */
@@ -1000,5 +1009,14 @@ extern const struct xattr_handler *fuse_acl_xattr_handlers[];
 struct posix_acl;
 struct posix_acl *fuse_get_acl(struct inode *inode, int type);
 int fuse_set_acl(struct inode *inode, struct posix_acl *acl, int type);
+
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+extern int sct_mode;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
+#ifdef CONFIG_OPLUS_FEATURE_ACM
+//Yuwei.Guan@BSP.Kernel.FS,2020/07/08, Add for acm
+void acm_fuse_init_cache(void);
+void acm_fuse_free_cache(void);
+#endif
 
 #endif /* _FS_FUSE_I_H */

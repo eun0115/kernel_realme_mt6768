@@ -49,6 +49,13 @@ MODULE_PARM_DESC(max_user_congthresh,
  "Global limit for the maximum congestion threshold an "
  "unprivileged user can set");
 
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+static bool shortcircuit = true;
+module_param(shortcircuit, bool, 0644);
+MODULE_PARM_DESC(shortcircuit, "Enable or disable fuse shortcircuit. Default: y/Y/1");
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
+
 #define FUSE_SUPER_MAGIC 0x65735546
 
 #define FUSE_DEFAULT_BLKSIZE 512
@@ -174,12 +181,6 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	inode->i_uid     = make_kuid(&init_user_ns, attr->uid);
 	inode->i_gid     = make_kgid(&init_user_ns, attr->gid);
 	inode->i_blocks  = attr->blocks;
-
-	/* Sanitize nsecs */
-	attr->atimensec = min_t(u32, attr->atimensec, NSEC_PER_SEC - 1);
-	attr->mtimensec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
-	attr->ctimensec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
-
 	inode->i_atime.tv_sec   = attr->atime;
 	inode->i_atime.tv_nsec  = attr->atimensec;
 	/* mtime from server may be stale due to local buffered write */
@@ -323,7 +324,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 		unlock_new_inode(inode);
 	} else if ((inode->i_mode ^ attr->mode) & S_IFMT) {
 		/* Inode has changed type, any I/O on the old should fail */
-		fuse_make_bad(inode);
+		make_bad_inode(inode);
 		iput(inode);
 		goto retry;
 	}
@@ -916,6 +917,16 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 				fc->async_dio = 1;
 			if (arg->flags & FUSE_WRITEBACK_CACHE)
 				fc->writeback_cache = 1;
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+			if (arg->flags & FUSE_SHORTCIRCUIT || fc->writeback_cache) {
+				/** an ugly way to determine FuseDaemon by writeback_cache
+				 *  since currently only FuseDaemon enable WBC
+				 */
+				fc->shortcircuit_io = shortcircuit ? 1 : 0;
+				pr_info("fuse sct flag: %d\n", shortcircuit);
+			}
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
 			if (arg->flags & FUSE_PARALLEL_DIROPS)
 				fc->parallel_dirops = 1;
 			if (arg->flags & FUSE_HANDLE_KILLPRIV)
@@ -957,7 +968,14 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 		FUSE_FLOCK_LOCKS | FUSE_HAS_IOCTL_DIR | FUSE_AUTO_INVAL_DATA |
 		FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_ASYNC_DIO |
 		FUSE_WRITEBACK_CACHE | FUSE_NO_OPEN_SUPPORT |
+#ifdef CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT
+//shubin@BSP.Kernel.FS 2020/08/20 improving fuse storage performance
+		FUSE_PARALLEL_DIROPS | FUSE_HANDLE_KILLPRIV | FUSE_POSIX_ACL |
+		FUSE_SHORTCIRCUIT;
+#else
 		FUSE_PARALLEL_DIROPS | FUSE_HANDLE_KILLPRIV | FUSE_POSIX_ACL;
+#endif /* CONFIG_OPLUS_FEATURE_FUSE_FS_SHORTCIRCUIT */
+
 	req->in.h.opcode = FUSE_INIT;
 	req->in.numargs = 1;
 	req->in.args[0].size = sizeof(*arg);
@@ -1000,7 +1018,7 @@ static int fuse_bdi_init(struct fuse_conn *fc, struct super_block *sb)
 
 	sb->s_bdi->ra_pages = (VM_MAX_READAHEAD * 1024) / PAGE_SIZE;
 	/* fuse does it's own writeback accounting */
-	sb->s_bdi->capabilities = BDI_CAP_NO_ACCT_WB | BDI_CAP_STRICTLIMIT;
+	sb->s_bdi->capabilities = BDI_CAP_NO_ACCT_WB;
 
 	/*
 	 * For a single fuse filesystem use max 1% of dirty +
@@ -1173,6 +1191,11 @@ static int fuse_fill_super(struct super_block *sb, void *data, int silent)
 
 	fuse_send_init(fc, init_req);
 
+#ifdef CONFIG_OPLUS_FEATURE_ACM
+//Yuwei.Guan@BSP.Kernel.FS,2020/07/08, Add for acm
+	acm_fuse_init_cache();
+#endif
+
 	return 0;
 
  err_unlock:
@@ -1204,6 +1227,10 @@ static void fuse_sb_destroy(struct super_block *sb)
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
 
 	if (fc) {
+#ifdef CONFIG_OPLUS_FEATURE_ACM
+//Yuwei.Guan@BSP.Kernel.FS,2020/07/08, Add for acm
+		acm_fuse_free_cache();
+#endif
 		fuse_send_destroy(fc);
 
 		fuse_abort_conn(fc);
