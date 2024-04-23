@@ -23,9 +23,7 @@
 #include "host.h"
 #include "mmc_ops.h"
 
-#define MMC_OPS_TIMEOUT_MS		(10 * 60 * 1000) /* 10min*/
-#define MMC_BKOPS_TIMEOUT_MS		(120 * 1000) /* 120s */
-#define MMC_CACHE_FLUSH_TIMEOUT_MS	(30 * 1000) /* 30s */
+#define MMC_OPS_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
 
 static const u8 tuning_blk_pattern_4bit[] = {
 	0xff, 0x0f, 0xff, 0x00, 0xff, 0xcc, 0xc3, 0xcc,
@@ -428,6 +426,46 @@ static int mmc_switch_status_error(struct mmc_host *host, u32 status)
 	return 0;
 }
 
+#ifdef CONFIG_MTK_EMMC_HW_CQ
+/**
+ *	mmc_prepare_switch - helper; prepare to modify EXT_CSD register
+ *	@card: the MMC card associated with the data transfer
+ *	@set: cmd set values
+ *	@index: EXT_CSD register index
+ *	@value: value to program into EXT_CSD register
+ *	@tout_ms: timeout (ms) for operation performed by register write,
+ *                   timeout of zero implies maximum possible timeout
+ *	@use_busy_signal: use the busy signal as response type
+ *
+ *	Helper to prepare to modify EXT_CSD register for selected card.
+ */
+static inline void mmc_prepare_switch(struct mmc_command *cmd, u8 index,
+				      u8 value, u8 set, unsigned int tout_ms,
+				      bool use_busy_signal)
+{
+	cmd->opcode = MMC_SWITCH;
+	cmd->arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) |
+		  (index << 16) |
+		  (value << 8) |
+		  set;
+	cmd->flags = MMC_CMD_AC;
+	cmd->busy_timeout = tout_ms;
+	if (use_busy_signal)
+		cmd->flags |= MMC_RSP_SPI_R1B | MMC_RSP_R1B;
+	else
+		cmd->flags |= MMC_RSP_SPI_R1 | MMC_RSP_R1;
+}
+
+int __mmc_switch_cmdq_mode(struct mmc_command *cmd, u8 set, u8 index, u8 value,
+			   unsigned int timeout_ms, bool use_busy_signal,
+			   bool ignore_timeout)
+{
+	mmc_prepare_switch(cmd, index, value, set, timeout_ms, use_busy_signal);
+	return 0;
+}
+EXPORT_SYMBOL(__mmc_switch_cmdq_mode);
+#endif
+
 /* Caller must hold re-tuning */
 int __mmc_switch_status(struct mmc_card *card, bool crc_err_fatal)
 {
@@ -457,6 +495,10 @@ static int mmc_poll_for_busy(struct mmc_card *card, unsigned int timeout_ms,
 	u32 status = 0;
 	bool expired = false;
 	bool busy = false;
+
+	/* We have an unspecified cmd timeout, use the fallback value. */
+	if (!timeout_ms)
+		timeout_ms = MMC_OPS_TIMEOUT_MS;
 
 	/*
 	 * In cases when not allowed to poll by using CMD13 or because we aren't
@@ -530,20 +572,14 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
 
 	mmc_retune_hold(host);
 
-	if (!timeout_ms) {
-		pr_warn("%s: unspecified timeout for CMD6 - use generic\n",
-			mmc_hostname(host));
-		timeout_ms = card->ext_csd.generic_cmd6_time;
-	}
-
 	/*
 	 * If the cmd timeout and the max_busy_timeout of the host are both
 	 * specified, let's validate them. A failure means we need to prevent
 	 * the host from doing hw busy detection, which is done by converting
 	 * to a R1 response instead of a R1B.
 	 */
-	if (host->max_busy_timeout &&
-	    (timeout_ms > host->max_busy_timeout))
+	if (timeout_ms && host->max_busy_timeout &&
+		(timeout_ms > host->max_busy_timeout))
 		use_r1b_resp = false;
 
 	cmd.opcode = MMC_SWITCH;
@@ -554,6 +590,10 @@ int __mmc_switch(struct mmc_card *card, u8 set, u8 index, u8 value,
 	cmd.flags = MMC_CMD_AC;
 	if (use_r1b_resp) {
 		cmd.flags |= MMC_RSP_SPI_R1B | MMC_RSP_R1B;
+		/*
+		 * A busy_timeout of zero means the host can decide to use
+		 * whatever value it finds suitable.
+		 */
 		cmd.busy_timeout = timeout_ms;
 	} else {
 		cmd.flags |= MMC_RSP_SPI_R1 | MMC_RSP_R1;
@@ -979,7 +1019,7 @@ void mmc_start_bkops(struct mmc_card *card, bool from_exception)
 
 	mmc_claim_host(card->host);
 	if (card->ext_csd.raw_bkops_status >= EXT_CSD_BKOPS_LEVEL_2) {
-		timeout = MMC_BKOPS_TIMEOUT_MS;
+		timeout = MMC_OPS_TIMEOUT_MS;
 		use_busy_signal = true;
 	} else {
 		timeout = 0;
@@ -1022,8 +1062,7 @@ int mmc_flush_cache(struct mmc_card *card)
 			(card->ext_csd.cache_size > 0) &&
 			(card->ext_csd.cache_ctrl & 1)) {
 		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-				 EXT_CSD_FLUSH_CACHE, 1,
-				 MMC_CACHE_FLUSH_TIMEOUT_MS);
+				EXT_CSD_FLUSH_CACHE, 1, 0);
 		if (err)
 			pr_err("%s: cache flush error %d\n",
 					mmc_hostname(card->host), err);
@@ -1033,20 +1072,33 @@ int mmc_flush_cache(struct mmc_card *card)
 }
 EXPORT_SYMBOL(mmc_flush_cache);
 
+#ifdef CONFIG_MTK_EMMC_HW_CQ
+int mmc_discard_queue(struct mmc_host *host, u32 tasks)
+{
+	struct mmc_command cmd = {0};
+
+	cmd.opcode = MMC_CMDQ_TASK_MGMT;
+	if (tasks) {
+		cmd.arg = DISCARD_TASK;
+		cmd.arg |= (tasks << 16);
+	} else {
+		cmd.arg = DISCARD_QUEUE;
+	}
+
+	cmd.flags = MMC_RSP_R1B | MMC_CMD_AC;
+
+	return mmc_wait_for_cmd(host, &cmd, 3);
+}
+EXPORT_SYMBOL(mmc_discard_queue);
+#endif
+
 static int mmc_cmdq_switch(struct mmc_card *card, bool enable)
 {
-	u8 val = enable ? EXT_CSD_CMDQ_MODE_ENABLED : 0;
-	int err;
-
-	if (!card->ext_csd.cmdq_support)
-		return -EOPNOTSUPP;
-
-	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_CMDQ_MODE_EN,
-			 val, card->ext_csd.generic_cmd6_time);
-	if (!err)
-		card->ext_csd.cmdq_en = enable;
-
-	return err;
+#if defined(CONFIG_MTK_EMMC_CQ_SUPPORT) || defined(CONFIG_MTK_EMMC_HW_CQ)
+	return mmc_blk_cmdq_switch(card, enable);
+#else
+	return 0;
+#endif
 }
 
 int mmc_cmdq_enable(struct mmc_card *card)

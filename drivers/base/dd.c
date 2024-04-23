@@ -346,6 +346,13 @@ int device_bind_driver(struct device *dev)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(device_bind_driver);
+#ifdef CONFIG_MTPROF
+#include "bootprof.h"
+#else
+#define TIME_LOG_START()
+#define TIME_LOG_END()
+#define bootprof_probe(ts, dev, drv, probe)
+#endif
 
 static atomic_t probe_count = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(probe_waitqueue);
@@ -356,7 +363,9 @@ static int really_probe(struct device *dev, struct device_driver *drv)
 	int local_trigger_count = atomic_read(&deferred_trigger_count);
 	bool test_remove = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE) &&
 			   !drv->suppress_bind_attrs;
-
+#ifdef CONFIG_MTPROF
+		unsigned long long ts = 0;
+#endif
 	if (defer_all_probes) {
 		/*
 		 * Value of defer_all_probes can be set only by
@@ -377,8 +386,7 @@ static int really_probe(struct device *dev, struct device_driver *drv)
 		 drv->bus->name, __func__, drv->name, dev_name(dev));
 	if (!list_empty(&dev->devres_head)) {
 		dev_crit(dev, "Resources present before probing\n");
-		ret = -EBUSY;
-		goto done;
+		return -EBUSY;
 	}
 
 re_probe:
@@ -406,11 +414,17 @@ re_probe:
 	}
 
 	if (dev->bus->probe) {
+		TIME_LOG_START();
 		ret = dev->bus->probe(dev);
+		TIME_LOG_END();
+		bootprof_probe(ts, dev, drv, (unsigned long)dev->bus->probe);
 		if (ret)
 			goto probe_failed;
 	} else if (drv->probe) {
+		TIME_LOG_START();
 		ret = drv->probe(dev);
+		TIME_LOG_END();
+		bootprof_probe(ts, dev, drv, (unsigned long)drv->probe);
 		if (ret)
 			goto probe_failed;
 	}
@@ -487,7 +501,7 @@ pinctrl_bind_failed:
 	ret = 0;
 done:
 	atomic_dec(&probe_count);
-	wake_up_all(&probe_waitqueue);
+	wake_up(&probe_waitqueue);
 	return ret;
 }
 
@@ -632,11 +646,6 @@ static int __device_attach_driver(struct device_driver *drv, void *_data)
 	} else if (ret == -EPROBE_DEFER) {
 		dev_dbg(dev, "Device match requests probe deferral\n");
 		driver_deferred_probe_add(dev);
-		/*
-		 * Device can't match with a driver right now, so don't attempt
-		 * to match or bind with other drivers on the bus.
-		 */
-		return ret;
 	} else if (ret < 0) {
 		dev_dbg(dev, "Bus failed to match device: %d", ret);
 		return ret;
@@ -779,18 +788,9 @@ static int __driver_attach(struct device *dev, void *data)
 	} else if (ret == -EPROBE_DEFER) {
 		dev_dbg(dev, "Device match requests probe deferral\n");
 		driver_deferred_probe_add(dev);
-		/*
-		 * Driver could not match with device, but may match with
-		 * another device on the bus.
-		 */
-		return 0;
 	} else if (ret < 0) {
-		dev_dbg(dev, "Bus failed to match device: %d\n", ret);
-		/*
-		 * Driver could not match with device, but may match with
-		 * another device on the bus.
-		 */
-		return 0;
+		dev_dbg(dev, "Bus failed to match device: %d", ret);
+		return ret;
 	} /* ret > 0 means positive match */
 
 	if (dev->parent)	/* Needed for USB */
@@ -830,8 +830,6 @@ static void __device_release_driver(struct device *dev, struct device *parent)
 
 	drv = dev->driver;
 	if (drv) {
-		pm_runtime_get_sync(dev);
-
 		while (device_links_busy(dev)) {
 			device_unlock(dev);
 			if (parent)
@@ -847,12 +845,11 @@ static void __device_release_driver(struct device *dev, struct device *parent)
 			 * have released the driver successfully while this one
 			 * was waiting, so check for that.
 			 */
-			if (dev->driver != drv) {
-				pm_runtime_put(dev);
+			if (dev->driver != drv)
 				return;
-			}
 		}
 
+		pm_runtime_get_sync(dev);
 		pm_runtime_clean_up_links(dev);
 
 		driver_sysfs_remove(dev);
@@ -869,6 +866,8 @@ static void __device_release_driver(struct device *dev, struct device *parent)
 		else if (drv->remove)
 			drv->remove(dev);
 
+		device_links_driver_cleanup(dev);
+
 		devres_release_all(dev);
 		dma_deconfigure(dev);
 		dev->driver = NULL;
@@ -876,8 +875,6 @@ static void __device_release_driver(struct device *dev, struct device *parent)
 		if (dev->pm_domain && dev->pm_domain->dismiss)
 			dev->pm_domain->dismiss(dev);
 		pm_runtime_reinit(dev);
-
-		device_links_driver_cleanup(dev);
 
 		klist_remove(&dev->p->knode_driver);
 		device_pm_check_callbacks(dev);

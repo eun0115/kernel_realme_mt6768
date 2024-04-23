@@ -261,8 +261,10 @@ static int verity_handle_err(struct dm_verity *v, enum verity_block_type type,
 	/* Corruption should be visible in device status in all modes */
 	v->hash_failed = 1;
 
-	if (v->corrupted_errs >= DM_VERITY_MAX_CORRUPTED_ERRS)
+	if (v->corrupted_errs >= DM_VERITY_MAX_CORRUPTED_ERRS) {
+		DMERR("%s: reached maximum errors", v->data_dev->name);
 		goto out;
+	}
 
 	v->corrupted_errs++;
 
@@ -288,6 +290,9 @@ static int verity_handle_err(struct dm_verity *v, enum verity_block_type type,
 
 	kobject_uevent_env(&disk_to_dev(dm_disk(md))->kobj, KOBJ_CHANGE, envp);
 
+	/* corrupted_errs count had not reached limits */
+	return 0;
+
 out:
 	if (v->mode == DM_VERITY_MODE_LOGGING)
 		return 0;
@@ -296,7 +301,11 @@ out:
 #ifdef CONFIG_DM_VERITY_AVB
 		dm_verity_avb_error_handler();
 #endif
-		kernel_restart("dm-verity device corrupted");
+
+//#ifdef VENDOR_EDIT
+		//Qiwu.Chen@BSP.Kernel.Stability, 2020/10/12, add feature: feedback 2.0, monitor abnormal restart
+		panic("dm-verity device corrupted");
+//#endif /* VENDOR_EDIT */
 	}
 
 	return 1;
@@ -579,15 +588,6 @@ static int verity_verify_io(struct dm_verity_io *io)
 }
 
 /*
- * Skip verity work in response to I/O error when system is shutting down.
- */
-static inline bool verity_is_system_shutting_down(void)
-{
-	return system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF
-		|| system_state == SYSTEM_RESTART;
-}
-
-/*
  * End one "io" structure with a given error.
  */
 static void verity_finish_io(struct dm_verity_io *io, blk_status_t status)
@@ -614,10 +614,7 @@ static void verity_end_io(struct bio *bio)
 {
 	struct dm_verity_io *io = bio->bi_private;
 
-	if (bio->bi_status &&
-	    (!verity_fec_is_enabled(io->v) ||
-	     verity_is_system_shutting_down() ||
-	     (bio->bi_opf & REQ_RAHEAD))) {
+	if (bio->bi_status && !verity_fec_is_enabled(io->v)) {
 		verity_finish_io(io, bio->bi_status);
 		return;
 	}
@@ -1240,7 +1237,6 @@ bad:
 
 static struct target_type verity_target = {
 	.name		= "verity",
-	.features	= DM_TARGET_IMMUTABLE,
 	.version	= {1, 4, 0},
 	.module		= THIS_MODULE,
 	.ctr		= verity_ctr,

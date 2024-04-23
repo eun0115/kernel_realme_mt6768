@@ -505,7 +505,10 @@ static void handle_error(void)
 	int mode = verity_mode();
 	if (mode == DM_VERITY_MODE_RESTART) {
 		DMERR("triggering restart");
-		kernel_restart("dm-verity device corrupted");
+//#ifdef VENDOR_EDIT
+		//Qiwu.Chen@BSP.Kernel.Stability, 2020/10/12, add feature: feedback 2.0, monitor abnormal restart
+		panic("dm-verity device corrupted");
+//#endif /* VENDOR_EDIT */
 	} else {
 		DMERR("Mounting verity root failed");
 	}
@@ -671,7 +674,7 @@ static int create_linear_device(struct dm_target *ti, dev_t dev,
 static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 {
 	dev_t uninitialized_var(dev);
-	struct android_metadata *metadata;
+	struct android_metadata *metadata = NULL;
 	int err = 0, i, mode;
 	char *key_id = NULL, *table_ptr, dummy, *target_device;
 	char *verity_table_args[VERITY_TABLE_ARGS + 2 + VERITY_TABLE_OPT_FEC_ARGS];
@@ -733,7 +736,7 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		}
 		DMERR("Error while extracting metadata");
 		handle_error();
-		return err;
+		goto free_metadata;
 	}
 
 	if (verity_enabled) {
@@ -864,10 +867,11 @@ static int android_verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 free_metadata:
-	kfree(metadata->header);
-	kfree(metadata->verity_table);
+	if (metadata) {
+		kfree(metadata->header);
+		kfree(metadata->verity_table);
+	}
 	kfree(metadata);
-
 	return err;
 }
 

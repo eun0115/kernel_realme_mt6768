@@ -26,8 +26,8 @@ static bool is_rtc_hctosys(struct rtc_device *rtc)
 	int size;
 	char name[NAME_SIZE];
 
-	size = snprintf(name, NAME_SIZE, "rtc%d", rtc->id);
-	if (size >= NAME_SIZE)
+	size = scnprintf(name, NAME_SIZE, "rtc%d", rtc->id);
+	if (size > NAME_SIZE)
 		return false;
 
 	return !strncmp(name, CONFIG_RTC_HCTOSYS_DEVICE, NAME_SIZE);
@@ -139,12 +139,22 @@ static const struct file_operations rtc_proc_fops = {
 
 void rtc_proc_add_device(struct rtc_device *rtc)
 {
+#ifdef VENDOR_EDIT
+    extern void __attribute__((weak)) saupwk_rtc_proc_add_device(struct rtc_device *rtc);
+    if(saupwk_rtc_proc_add_device)
+        saupwk_rtc_proc_add_device(rtc);
+#endif
 	if (is_rtc_hctosys(rtc))
 		proc_create_data("driver/rtc", 0, NULL, &rtc_proc_fops, rtc);
 }
 
 void rtc_proc_del_device(struct rtc_device *rtc)
 {
+#ifdef VENDOR_EDIT
+    extern void __attribute__((weak)) saupwk_rtc_proc_del_device(struct rtc_device *rtc);
+    if(saupwk_rtc_proc_del_device)
+        saupwk_rtc_proc_del_device(rtc);
+#endif
 	if (is_rtc_hctosys(rtc))
 		remove_proc_entry("driver/rtc", NULL);
 }

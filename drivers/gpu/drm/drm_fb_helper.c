@@ -1620,6 +1620,7 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 	 */
 	var->bits_per_pixel = fb->format->cpp[0] * 8;
 
+#if 0
 	/*
 	 * drm fbdev emulation doesn't support changing the pixel format at all,
 	 * so reject all pixel format changing requests.
@@ -1628,7 +1629,7 @@ int drm_fb_helper_check_var(struct fb_var_screeninfo *var,
 		DRM_DEBUG("fbdev emulation doesn't support changing the pixel format\n");
 		return -EINVAL;
 	}
-
+#endif
 	return 0;
 }
 EXPORT_SYMBOL(drm_fb_helper_check_var);
@@ -1736,11 +1737,12 @@ int drm_fb_helper_pan_display(struct fb_var_screeninfo *var,
 		return -EBUSY;
 
 	mutex_lock(&fb_helper->lock);
+#if 0
 	if (!drm_fb_helper_is_bound(fb_helper)) {
 		mutex_unlock(&fb_helper->lock);
 		return -EBUSY;
 	}
-
+#endif
 	if (drm_drv_uses_atomic_modeset(dev))
 		ret = pan_display_atomic(var, info);
 	else
@@ -2112,9 +2114,6 @@ static bool drm_target_cloned(struct drm_fb_helper *fb_helper,
 	can_clone = true;
 	dmt_mode = drm_mode_find_dmt(fb_helper->dev, 1024, 768, 60, false);
 
-	if (!dmt_mode)
-		goto fail;
-
 	drm_fb_helper_for_each_connector(fb_helper, i) {
 		if (!enabled[i])
 			continue;
@@ -2127,13 +2126,11 @@ static bool drm_target_cloned(struct drm_fb_helper *fb_helper,
 		if (!modes[i])
 			can_clone = false;
 	}
-	kfree(dmt_mode);
 
 	if (can_clone) {
 		DRM_DEBUG_KMS("can clone using 1024x768\n");
 		return true;
 	}
-fail:
 	DRM_INFO("kms: can't enable cloning when we probably wanted to.\n");
 	return false;
 }
@@ -2617,3 +2614,24 @@ int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
 	return 0;
 }
 EXPORT_SYMBOL(drm_fb_helper_hotplug_event);
+
+/* The Kconfig DRM_KMS_HELPER selects FRAMEBUFFER_CONSOLE (if !EXPERT)
+ * but the module doesn't depend on any fb console symbols.  At least
+ * attempt to load fbcon to avoid leaving the system without a usable console.
+ */
+int __init drm_fb_helper_modinit(void)
+{
+#if defined(CONFIG_FRAMEBUFFER_CONSOLE_MODULE) && !defined(CONFIG_EXPERT)
+	const char name[] = "fbcon";
+	struct module *fbcon;
+
+	mutex_lock(&module_mutex);
+	fbcon = find_module(name);
+	mutex_unlock(&module_mutex);
+
+	if (!fbcon)
+		request_module_nowait(name);
+#endif
+	return 0;
+}
+EXPORT_SYMBOL(drm_fb_helper_modinit);

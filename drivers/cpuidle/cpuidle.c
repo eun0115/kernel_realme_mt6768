@@ -22,6 +22,9 @@
 #include <linux/module.h>
 #include <linux/suspend.h>
 #include <linux/tick.h>
+#ifdef CONFIG_OPLUS_FEATURE_MIDAS
+#include <linux/cpufreq.h>
+#endif
 #include <trace/events/power.h>
 
 #include "cpuidle.h"
@@ -144,8 +147,7 @@ static void enter_s2idle_proper(struct cpuidle_driver *drv,
 	 */
 	stop_critical_timings();
 	drv->states[index].enter_s2idle(dev, drv, index);
-	if (WARN_ON_ONCE(!irqs_disabled()))
-		local_irq_disable();
+	WARN_ON(!irqs_disabled());
 	/*
 	 * timekeeping_resume() that will be called by tick_unfreeze() for the
 	 * first CPU executing it calls functions containing RCU read-side
@@ -218,9 +220,15 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 	trace_cpu_idle_rcuidle(index, dev->cpu);
 	time_start = ns_to_ktime(local_clock());
 
+#ifdef CONFIG_OPLUS_FEATURE_MIDAS
+	cpufreq_stats_idle_hook(dev->cpu, 1);
+#endif
 	stop_critical_timings();
 	entered_state = target_state->enter(dev, drv, index);
 	start_critical_timings();
+#ifdef CONFIG_OPLUS_FEATURE_MIDAS
+	cpufreq_stats_idle_hook(dev->cpu, 0);
+#endif
 
 	sched_clock_idle_wakeup_event();
 	time_end = ns_to_ktime(local_clock());

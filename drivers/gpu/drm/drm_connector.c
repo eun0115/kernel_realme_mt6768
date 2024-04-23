@@ -86,6 +86,7 @@ static struct drm_conn_prop_enum_list drm_connector_enum_list[] = {
 	{ DRM_MODE_CONNECTOR_VIRTUAL, "Virtual" },
 	{ DRM_MODE_CONNECTOR_DSI, "DSI" },
 	{ DRM_MODE_CONNECTOR_DPI, "DPI" },
+	{ DRM_MODE_CONNECTOR_WRITEBACK, "Writeback" },
 };
 
 void drm_connector_ida_init(void)
@@ -222,7 +223,8 @@ int drm_connector_init(struct drm_device *dev,
 	config->num_connector++;
 	spin_unlock_irq(&config->connector_list_lock);
 
-	if (connector_type != DRM_MODE_CONNECTOR_VIRTUAL)
+	if (connector_type != DRM_MODE_CONNECTOR_VIRTUAL &&
+	    connector_type != DRM_MODE_CONNECTOR_WRITEBACK)
 		drm_connector_attach_edid_property(connector);
 
 	drm_object_attach_property(&connector->base,
@@ -253,6 +255,7 @@ EXPORT_SYMBOL(drm_connector_init);
 
 /**
  * drm_connector_attach_edid_property - attach edid property.
+ * @dev: DRM device
  * @connector: the connector
  *
  * Some connector types like DRM_MODE_CONNECTOR_VIRTUAL do not get a
@@ -368,9 +371,6 @@ void drm_connector_cleanup(struct drm_connector *connector)
 	mutex_destroy(&connector->mutex);
 
 	memset(connector, 0, sizeof(*connector));
-
-	if (dev->registered)
-		drm_sysfs_hotplug_event(dev);
 }
 EXPORT_SYMBOL(drm_connector_cleanup);
 
@@ -1307,7 +1307,8 @@ int drm_mode_getconnector(struct drm_device *dev, void *data,
 
 	memset(&u_mode, 0, sizeof(struct drm_mode_modeinfo));
 
-	connector = drm_connector_lookup(dev, out_resp->connector_id);
+	connector = drm_connector_lookup(dev, file_priv,
+					out_resp->connector_id);
 	if (!connector)
 		return -ENOENT;
 

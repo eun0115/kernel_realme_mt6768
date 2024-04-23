@@ -231,14 +231,15 @@ int thermal_build_list_of_policies(char *buf)
 {
 	struct thermal_governor *pos;
 	ssize_t count = 0;
+	ssize_t size = PAGE_SIZE;
 
 	mutex_lock(&thermal_governor_lock);
 
 	list_for_each_entry(pos, &thermal_governor_list, governor_list) {
-		count += scnprintf(buf + count, PAGE_SIZE - count, "%s ",
-				   pos->name);
+		size = PAGE_SIZE - count;
+		count += scnprintf(buf + count, size, "%s ", pos->name);
 	}
-	count += scnprintf(buf + count, PAGE_SIZE - count, "\n");
+	count += scnprintf(buf + count, size, "\n");
 
 	mutex_unlock(&thermal_governor_lock);
 
@@ -292,11 +293,13 @@ static void thermal_zone_device_set_polling(struct thermal_zone_device *tz,
 					    int delay)
 {
 	if (delay > 1000)
-		mod_delayed_work(system_freezable_wq, &tz->poll_queue,
-				 round_jiffies(msecs_to_jiffies(delay)));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+					&tz->poll_queue,
+					round_jiffies(msecs_to_jiffies(delay)));
 	else if (delay)
-		mod_delayed_work(system_freezable_wq, &tz->poll_queue,
-				 msecs_to_jiffies(delay));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+					&tz->poll_queue,
+					msecs_to_jiffies(delay));
 	else
 		cancel_delayed_work(&tz->poll_queue);
 }
@@ -457,8 +460,6 @@ static void thermal_zone_device_init(struct thermal_zone_device *tz)
 {
 	struct thermal_instance *pos;
 	tz->temperature = THERMAL_TEMP_INVALID;
-	tz->prev_low_trip = -INT_MAX;
-	tz->prev_high_trip = INT_MAX;
 	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
 		pos->initialized = false;
 }
@@ -737,8 +738,7 @@ int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
 	if (result)
 		goto release_ida;
 
-	snprintf(dev->attr_name, sizeof(dev->attr_name), "cdev%d_trip_point",
-		 dev->id);
+	sprintf(dev->attr_name, "cdev%d_trip_point", dev->id);
 	sysfs_attr_init(&dev->attr.attr);
 	dev->attr.attr.name = dev->attr_name;
 	dev->attr.attr.mode = 0444;
@@ -747,8 +747,7 @@ int thermal_zone_bind_cooling_device(struct thermal_zone_device *tz,
 	if (result)
 		goto remove_symbol_link;
 
-	snprintf(dev->weight_attr_name, sizeof(dev->weight_attr_name),
-		 "cdev%d_weight", dev->id);
+	sprintf(dev->weight_attr_name, "cdev%d_weight", dev->id);
 	sysfs_attr_init(&dev->weight_attr.attr);
 	dev->weight_attr.attr.name = dev->weight_attr_name;
 	dev->weight_attr.attr.mode = S_IWUSR | S_IRUGO;
@@ -1275,14 +1274,14 @@ thermal_zone_device_register(const char *type, int trips, int mask,
 			goto unregister;
 	}
 
+	INIT_DELAYED_WORK(&(tz->poll_queue), thermal_zone_device_check);
+
 	mutex_lock(&thermal_list_lock);
 	list_add_tail(&tz->node, &thermal_tz_list);
 	mutex_unlock(&thermal_list_lock);
 
 	/* Bind cooling devices for this zone */
 	bind_tz(tz);
-
-	INIT_DELAYED_WORK(&tz->poll_queue, thermal_zone_device_check);
 
 	thermal_zone_device_reset(tz);
 	/* Update the new thermal zone and mark it as already updated. */
@@ -1307,7 +1306,7 @@ free_tz:
 EXPORT_SYMBOL_GPL(thermal_zone_device_register);
 
 /**
- * thermal_zone_device_unregister - removes the registered thermal zone device
+ * thermal_device_unregister - removes the registered thermal zone device
  * @tz: the thermal zone device to remove
  */
 void thermal_zone_device_unregister(struct thermal_zone_device *tz)
@@ -1323,6 +1322,12 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 	tzp = tz->tzp;
 
 	mutex_lock(&thermal_list_lock);
+
+	tz->polling_delay = 0;
+
+	/* force stop pending/running delayed work*/
+	cancel_delayed_work_sync(&(tz->poll_queue));
+
 	list_for_each_entry(pos, &thermal_tz_list, node)
 		if (pos == tz)
 			break;
@@ -1353,7 +1358,7 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 
 	mutex_unlock(&thermal_list_lock);
 
-	cancel_delayed_work_sync(&tz->poll_queue);
+	/* thermal_zone_device_set_polling(tz, 0); */
 
 	thermal_set_governor(tz, NULL);
 
@@ -1509,11 +1514,13 @@ static int thermal_pm_notify(struct notifier_block *nb,
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
 		atomic_set(&in_suspend, 0);
+		mutex_lock(&thermal_list_lock);
 		list_for_each_entry(tz, &thermal_tz_list, node) {
 			thermal_zone_device_init(tz);
 			thermal_zone_device_update(tz,
 						   THERMAL_EVENT_UNSPECIFIED);
 		}
+		mutex_unlock(&thermal_list_lock);
 		break;
 	default:
 		break;
