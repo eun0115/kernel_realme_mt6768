@@ -170,10 +170,6 @@ struct pinctrl *consys_pinctrl;
 struct work_struct plt_resume_worker;
 static void plat_resume_handler(struct work_struct *work);
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
-struct regmap *g_regmap;
-#endif
-
 static int wmt_thermal_get_temp_cb(void *data, int *temp);
 static const struct thermal_zone_of_device_ops tz_wmt_thermal_ops = {
 	.get_temp = wmt_thermal_get_temp_cb,
@@ -257,12 +253,6 @@ static VOID mtk_wcn_get_regmap(struct platform_device *pdev)
 	if (!chip) {
 		WMT_PLAT_PR_INFO("get chip fail\n");
 		return;
-	}
-
-	g_regmap = chip->regmap;
-	if (IS_ERR_VALUE(g_regmap)) {
-		g_regmap = NULL;
-		WMT_PLAT_PR_INFO("get regmap fail\n");
 	}
 }
 #endif
