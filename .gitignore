@@ -132,3 +132,9 @@ all.config
 
 # Kdevelop4
 *.kdev4
+
+clang
+AnyKernel
+out
+even.sh
+log.txt
