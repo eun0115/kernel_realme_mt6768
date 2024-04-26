@@ -26,7 +26,7 @@
 #include <linux/syscalls.h>
 #include <linux/unistd.h>
 #include <linux/workqueue.h>
-#include "../system/include/oplus_project.h"
+#include "soc/oplus/system/oplus_project.h"
 #include "../../../misc/mediatek/sensors-1.0/oplus_sensor_devinfo/sensor_devinfo.h"
 #define SENSOR_ALSPARA_DELAY_FIRST_TIME  10000
 #define SENSOR_ALSPARA_DELAY_TIME  3000
